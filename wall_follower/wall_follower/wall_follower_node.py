@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Left wall-following node using LiDAR for the Andino robot.
+
+Subscribes to /scan (LaserScan) and publishes /cmd_vel (Twist).
+Uses a PD controller to maintain a desired distance from the left wall.
+"""
+
+import math
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+
+class WallFollowerNode(Node):
+    def __init__(self):
+        super().__init__('wall_follower')
+
+        # Declare parameters
+        self.declare_parameter('desired_distance', 1.0)
+        self.declare_parameter('forward_speed', 0.15)
+        self.declare_parameter('kp', 1.2)
+        self.declare_parameter('kd', 0.4)
+        self.declare_parameter('front_obstacle_dist', 0.5)
+        self.declare_parameter('max_wall_search_dist', 3.0)
+        self.declare_parameter('scan_topic', 'scan')
+        self.declare_parameter('cmd_vel_topic', 'cmd_vel')
+
+        # Read parameters
+        self.desired_dist = self.get_parameter('desired_distance').value
+        self.forward_speed = self.get_parameter('forward_speed').value
+        self.kp = self.get_parameter('kp').value
+        self.kd = self.get_parameter('kd').value
+        self.front_obs_dist = self.get_parameter('front_obstacle_dist').value
+        self.max_search_dist = self.get_parameter('max_wall_search_dist').value
+
+        scan_topic = self.get_parameter('scan_topic').value
+        cmd_topic = self.get_parameter('cmd_vel_topic').value
+
+        # State
+        self.prev_error = 0.0
+        self.prev_time = None
+
+        # Publishers & Subscribers
+        self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
+        self.scan_sub = self.create_subscription(LaserScan, scan_topic, self.scan_callback, 10)
+
+        self.get_logger().info(
+            f'Wall follower started: desired_dist={self.desired_dist}m, '
+            f'speed={self.forward_speed}m/s, kp={self.kp}, kd={self.kd}'
+        )
+
+    def _get_min_range_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> float:
+        """Get minimum valid range in angular sector [angle_start, angle_end] in radians."""
+        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_end = int((angle_end - msg.angle_min) / msg.angle_increment)
+        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
+        idx_end = max(0, min(idx_end, len(msg.ranges) - 1))
+        if idx_start > idx_end:
+            idx_start, idx_end = idx_end, idx_start
+
+        valid_ranges = []
+        for i in range(idx_start, idx_end + 1):
+            r = msg.ranges[i]
+            if not (math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max):
+                valid_ranges.append(r)
+
+        return min(valid_ranges) if valid_ranges else float('inf')
+
+    def scan_callback(self, msg: LaserScan):
+        now = self.get_clock().now()
+        cmd = Twist()
+
+        # ── Measure key sectors ─────────────────────────────────────
+        # Left wall: 60° to 120°
+        left_dist = self._get_min_range_sector(msg, math.radians(60), math.radians(120))
+        # Slightly left-forward: 30° to 60° (anticipate curves)
+        left_fwd_dist = self._get_min_range_sector(msg, math.radians(30), math.radians(60))
+        # Front: -30° to 30°
+        front_dist = self._get_min_range_sector(msg, math.radians(-30), math.radians(30))
+
+        # Best estimate of left wall distance
+        wall_dist = min(left_dist, left_fwd_dist * 1.1)
+
+        # ── State machine ───────────────────────────────────────────
+        if front_dist < self.front_obs_dist:
+            # FRONT OBSTACLE: turn right sharply
+            cmd.linear.x = 0.02
+            cmd.angular.z = -0.8
+            self.prev_error = 0.0
+            self.get_logger().info(
+                f'FRONT OBSTACLE {front_dist:.2f}m — turning right', throttle_duration_sec=0.5)
+
+        elif wall_dist > self.max_search_dist:
+            # NO WALL FOUND: drive forward and gently turn left to find one
+            cmd.linear.x = self.forward_speed
+            cmd.angular.z = 0.3  # positive = turn left in ROS
+            self.prev_error = 0.0
+            self.get_logger().info(
+                f'SEARCHING for left wall (left={left_dist:.2f}m)', throttle_duration_sec=1.0)
+
+        else:
+            # WALL FOLLOWING with PD control
+            # error > 0 means too far from wall → turn left (positive angular.z)
+            # error < 0 means too close → turn right (negative angular.z)
+            error = wall_dist - self.desired_dist
+
+            dt = 0.1
+            if self.prev_time is not None:
+                dt = max((now - self.prev_time).nanoseconds * 1e-9, 0.01)
+            d_error = (error - self.prev_error) / dt
+
+            self.prev_error = error
+
+            angular_z = self.kp * error + self.kd * d_error
+            angular_z = max(-1.0, min(1.0, angular_z))  # clamp
+
+            # Slow down when turning hard
+            speed_scale = max(0.3, 1.0 - abs(angular_z) * 0.5)
+            cmd.linear.x = self.forward_speed * speed_scale
+            cmd.angular.z = angular_z
+
+            self.get_logger().info(
+                f'FOLLOWING left={wall_dist:.2f}m err={error:+.2f} '
+                f'ang={angular_z:+.2f} spd={cmd.linear.x:.2f}',
+                throttle_duration_sec=1.0)
+
+        self.prev_time = now
+        self.cmd_pub.publish(cmd)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = WallFollowerNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cmd = Twist()
+        node.cmd_pub.publish(cmd)
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
