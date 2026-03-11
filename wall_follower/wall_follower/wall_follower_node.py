@@ -17,11 +17,12 @@ class WallFollowerNode(Node):
         super().__init__('wall_follower')
 
         # Declare parameters
-        self.declare_parameter('desired_distance', 1.0)
+        self.declare_parameter('desired_distance', 1.5)
         self.declare_parameter('forward_speed', 0.15)
         self.declare_parameter('kp', 1.2)
         self.declare_parameter('kd', 0.4)
-        self.declare_parameter('front_obstacle_dist', 0.5)
+        self.declare_parameter('front_obstacle_dist', 0.8)
+        self.declare_parameter('front_slowdown_dist', 1.5)
         self.declare_parameter('max_wall_search_dist', 3.0)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
@@ -32,6 +33,7 @@ class WallFollowerNode(Node):
         self.kp = self.get_parameter('kp').value
         self.kd = self.get_parameter('kd').value
         self.front_obs_dist = self.get_parameter('front_obstacle_dist').value
+        self.front_slow_dist = self.get_parameter('front_slowdown_dist').value
         self.max_search_dist = self.get_parameter('max_wall_search_dist').value
 
         scan_topic = self.get_parameter('scan_topic').value
@@ -72,21 +74,29 @@ class WallFollowerNode(Node):
         cmd = Twist()
 
         # ── Measure key sectors ─────────────────────────────────────
-        # Left wall: 60° to 120°
-        left_dist = self._get_min_range_sector(msg, math.radians(60), math.radians(120))
-        # Slightly left-forward: 30° to 60° (anticipate curves)
-        left_fwd_dist = self._get_min_range_sector(msg, math.radians(30), math.radians(60))
-        # Front: -30° to 30°
-        front_dist = self._get_min_range_sector(msg, math.radians(-30), math.radians(30))
+        # NOTE: LiDAR is mounted rotated 180° (π) in the URDF.
+        #   Scan angle   0   = robot BACK
+        #   Scan angle  ±π   = robot FRONT
+        #   Scan angle  -π/2 = robot LEFT
+        #   Scan angle  +π/2 = robot RIGHT
+
+        # Left wall: -120° to -60° (centered on -90° = robot's left)
+        left_dist = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
+        # Slightly left-forward: -160° to -120° (anticipate curves)
+        left_fwd_dist = self._get_min_range_sector(msg, math.radians(-160), math.radians(-120))
+        # Front: two sectors near ±180° (robot forward)
+        front_left = self._get_min_range_sector(msg, math.radians(135), math.radians(179))
+        front_right = self._get_min_range_sector(msg, math.radians(-179), math.radians(-135))
+        front_dist = min(front_left, front_right)
 
         # Best estimate of left wall distance
         wall_dist = min(left_dist, left_fwd_dist * 1.1)
 
         # ── State machine ───────────────────────────────────────────
         if front_dist < self.front_obs_dist:
-            # FRONT OBSTACLE: turn right sharply
-            cmd.linear.x = 0.02
-            cmd.angular.z = -0.8
+            # FRONT OBSTACLE: stop and turn right sharply
+            cmd.linear.x = 0.0
+            cmd.angular.z = -1.0
             self.prev_error = 0.0
             self.get_logger().info(
                 f'FRONT OBSTACLE {front_dist:.2f}m — turning right', throttle_duration_sec=0.5)
@@ -115,8 +125,14 @@ class WallFollowerNode(Node):
             angular_z = self.kp * error + self.kd * d_error
             angular_z = max(-1.0, min(1.0, angular_z))  # clamp
 
-            # Slow down when turning hard
+            # Slow down when turning hard or approaching front wall
             speed_scale = max(0.3, 1.0 - abs(angular_z) * 0.5)
+            if front_dist < self.front_slow_dist:
+                # Progressive slowdown as we approach a front wall
+                front_scale = max(0.1, (front_dist - self.front_obs_dist) / (self.front_slow_dist - self.front_obs_dist))
+                speed_scale *= front_scale
+                # Also start turning right as we approach
+                angular_z = min(angular_z, -0.3)
             cmd.linear.x = self.forward_speed * speed_scale
             cmd.angular.z = angular_z
 
