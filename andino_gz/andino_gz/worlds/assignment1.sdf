@@ -1,0 +1,154 @@
+<?xml version="1.0" ?>
+<sdf version="1.8">
+  <world name="assignment1">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ==================== L-shaped wall ==================== -->
+    <model name="l_shape">
+      <static>true</static>
+      <!-- Vertical arm (facing north / upward) -->
+      <link name="l_vertical">
+        <pose>-1.00 2.982 0.5 0 0 0</pose>
+        <collision name="c1"><geometry><box><size>0.5 5.5 1</size></box></geometry></collision>
+        <visual name="v1"><geometry><box><size>0.5 5.5 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <!-- Horizontal arm (bottom, extending right to circle gap left edge) -->
+      <link name="l_horizontal">
+        <pose> 0.175 0 0.5 0 0 0</pose>
+        <collision name="c2"><geometry><box><size>2.85 0.7 1</size></box></geometry></collision>
+        <visual name="v2"><geometry><box><size>2.85 0.7 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+    </model>
+
+    <!-- ==================== Open circle (270 arc, gap at bottom) ==================== -->
+    <!-- Circle center: (3, 2), R=2.5. Gap from -135 to -45 deg (bottom). -->
+    <!-- 18 segments at 15-deg steps from -37.5 deg to 217.5 deg -->
+    <model name="o_ring">
+      <static>true</static>
+      <link name="seg_1">
+        <pose>4.983 0.478 0.5 0 0 -0.654</pose>
+        <collision name="c1"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v1"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_2">
+        <pose>5.310 1.043 0.5 0 0 -0.393</pose>
+        <collision name="c2"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v2"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_3">
+        <pose>5.479 1.674 0.5 0 0 -0.131</pose>
+        <collision name="c3"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v3"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_4">
+        <pose>5.479 2.326 0.5 0 0 0.131</pose>
+        <collision name="c4"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v4"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_5">
+        <pose>5.310 2.957 0.5 0 0 0.393</pose>
+        <collision name="c5"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v5"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_6">
+        <pose>4.983 3.522 0.5 0 0 0.654</pose>
+        <collision name="c6"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v6"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_7">
+        <pose>4.522 3.983 0.5 0 0 0.916</pose>
+        <collision name="c7"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v7"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_8">
+        <pose>3.957 4.310 0.5 0 0 1.178</pose>
+        <collision name="c8"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v8"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_9">
+        <pose>3.326 4.479 0.5 0 0 1.440</pose>
+        <collision name="c9"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v9"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_10">
+        <pose>2.674 4.479 0.5 0 0 1.702</pose>
+        <collision name="c10"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v10"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_11">
+        <pose>2.043 4.310 0.5 0 0 1.963</pose>
+        <collision name="c11"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v11"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_12">
+        <pose>1.478 3.983 0.5 0 0 2.225</pose>
+        <collision name="c12"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v12"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_13">
+        <pose>1.017 3.522 0.5 0 0 2.487</pose>
+        <collision name="c13"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v13"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_14">
+        <pose>0.690 2.957 0.5 0 0 2.749</pose>
+        <collision name="c14"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v14"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_15">
+        <pose>0.521 2.326 0.5 0 0 3.011</pose>
+        <collision name="c15"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v15"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_16">
+        <pose>0.521 1.674 0.5 0 0 3.272</pose>
+        <collision name="c16"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v16"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_17">
+        <pose>0.690 1.043 0.5 0 0 3.534</pose>
+        <collision name="c17"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v17"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+      <link name="seg_18">
+        <pose>1.017 0.478 0.5 0 0 3.796</pose>
+        <collision name="c18"><geometry><box><size>0.751 1.000 1</size></box></geometry></collision>
+        <visual name="v18"><geometry><box><size>0.751 1.000 1</size></box></geometry><material><ambient>0.1 0.1 0.1 1</ambient></material></visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
