@@ -16,11 +16,16 @@ def generate_launch_description():
 
     entity_arg = DeclareLaunchArgument(
         'entity', default_value='andino', description='Name of the entity to bridge with Gazebo.')
+    world_name_arg = DeclareLaunchArgument(
+        'world_name', default_value='assignment1', description='Name of the Gazebo world (without .sdf).')
 
-    # A <entity> placeholder is used in the bridge config file to be replaced by the entity name.
+    # Replace <entity> and <world> placeholders in the bridge config file.
     bridge_config = ReplaceString(
         source_file=bridge_config_file_path,
-        replacements={'<entity>': LaunchConfiguration('entity')},
+        replacements={
+            '<entity>': LaunchConfiguration('entity'),
+            '<world>': LaunchConfiguration('world_name'),
+        },
     )
 
     bridge_node = Node(
@@ -34,5 +39,6 @@ def generate_launch_description():
 
     return LaunchDescription([
         entity_arg,
+        world_name_arg,
         bridge_node,
     ])
