@@ -23,7 +23,7 @@ CIRCLE_R_OUTER = 3.0
 
 # ── Spawn constraints ──────────────────────────────────────────────────
 MIN_WALL_DIST = 0.5   # must be at least this far from any wall surface
-MAX_WALL_DIST = 2.5   # must be within this distance of some wall
+MAX_WALL_DIST = 2.0   # must be within this distance of some wall
 ROBOT_Z = 0.05        # ground level (just above floor)
 
 # Bounding box for candidate sampling (encompasses everything + margin)

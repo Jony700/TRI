@@ -115,6 +115,7 @@ def generate_launch_description():
                 'rviz': rviz,
                 'ros_bridge': ros_bridge,
                 'nav2': nav2_flag,
+                'world_name': world_name,
             },
             actions=[
                 LogInfo(msg="Group for robot: " + robot_name),
@@ -167,6 +168,7 @@ def generate_launch_description():
                     ),
                     launch_arguments={
                         'entity': robot_name,
+                        'world_name': PythonExpression(['"', world_name, '".split(".")[0]']),
                     }.items(),
                     condition=IfCondition(LaunchConfiguration('ros_bridge')),
                 ),

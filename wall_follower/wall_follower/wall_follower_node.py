@@ -3,6 +3,7 @@
 
 Subscribes to /scan (LaserScan) and publishes /cmd_vel (Twist).
 Uses a PD controller to maintain a desired distance from the left wall.
+Stops when inside the circle (>60% of LiDAR readings are valid/not inf).
 """
 
 import math
@@ -26,6 +27,8 @@ class WallFollowerNode(Node):
         self.declare_parameter('max_wall_search_dist', 3.0)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
+        self.declare_parameter('inside_ratio_threshold', 0.6)
+        self.declare_parameter('stop_confirmation_count', 15)
 
         # Read parameters
         self.desired_dist = self.get_parameter('desired_distance').value
@@ -35,6 +38,8 @@ class WallFollowerNode(Node):
         self.front_obs_dist = self.get_parameter('front_obstacle_dist').value
         self.front_slow_dist = self.get_parameter('front_slowdown_dist').value
         self.max_search_dist = self.get_parameter('max_wall_search_dist').value
+        self.inside_ratio = self.get_parameter('inside_ratio_threshold').value
+        self.stop_confirm_needed = self.get_parameter('stop_confirmation_count').value
 
         scan_topic = self.get_parameter('scan_topic').value
         cmd_topic = self.get_parameter('cmd_vel_topic').value
@@ -42,6 +47,8 @@ class WallFollowerNode(Node):
         # State
         self.prev_error = 0.0
         self.prev_time = None
+        self.is_stopped = False
+        self.stop_confirm_count = 0
 
         # Publishers & Subscribers
         self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
@@ -69,9 +76,38 @@ class WallFollowerNode(Node):
 
         return min(valid_ranges) if valid_ranges else float('inf')
 
+    def _valid_reading_ratio(self, msg: LaserScan) -> float:
+        """Return the fraction of LiDAR readings that are valid (not inf/nan)."""
+        valid = 0
+        for r in msg.ranges:
+            if not (math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max):
+                valid += 1
+        return valid / len(msg.ranges) if msg.ranges else 0.0
+
     def scan_callback(self, msg: LaserScan):
+        if self.is_stopped:
+            self.cmd_pub.publish(Twist())
+            return
+
         now = self.get_clock().now()
         cmd = Twist()
+
+        # ── Check if inside the circle ──────────────────────────────
+        # When >60% of lidar readings see a wall, we're inside → stop.
+        ratio = self._valid_reading_ratio(msg)
+        if ratio >= self.inside_ratio:
+            self.stop_confirm_count += 1
+            self.get_logger().info(
+                f'INSIDE CHECK {self.stop_confirm_count}/{self.stop_confirm_needed} '
+                f'valid={ratio:.0%}', throttle_duration_sec=0.5)
+            if self.stop_confirm_count >= self.stop_confirm_needed:
+                self.is_stopped = True
+                self.get_logger().info(
+                    f'STOPPED: Inside the circle ({ratio:.0%} valid readings).')
+                self.cmd_pub.publish(Twist())
+                return
+        else:
+            self.stop_confirm_count = 0
 
         # ── Measure key sectors ─────────────────────────────────────
         # NOTE: LiDAR is mounted rotated 180° (π) in the URDF.
