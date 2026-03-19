@@ -182,12 +182,13 @@ class WallFollowerNode(Node):
 
 
 def main(args=None):
+
     rclpy.init(args=args)
     node = WallFollowerNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+    
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    
     finally:
         cmd = Twist()
         node.cmd_pub.publish(cmd)

@@ -12,8 +12,8 @@ Simulação Gazebo com um robot diferencial (Andino) que segue paredes usando Li
 
 ```bash
 cd ~/tri_ws
-colcon build
 source install/setup.bash
+colcon build
 ```
 
 ## Correr a simulação
