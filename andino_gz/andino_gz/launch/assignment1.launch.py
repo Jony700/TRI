@@ -30,6 +30,7 @@ ROBOT_Z = 0.05        # ground level (just above floor)
 SAMPLE_X_MIN, SAMPLE_X_MAX = -4.0, 8.0
 SAMPLE_Y_MIN, SAMPLE_Y_MAX = -3.0, 7.0
 
+FIXED_SPAWN = 1
 
 def _box_distance(px, py, cx, cy, sx, sy):
     """Signed distance from point (px,py) to axis-aligned box centered at (cx,cy) with size (sx,sy).
@@ -71,6 +72,15 @@ def closest_wall_distance(px, py):
     return min(d_vert, d_horiz, d_ring)
 
 
+def fixed_spawn():
+    """Deterministic spawn near the head of the 5 (top of the L-wall).
+
+    Places the robot just outside the top of the L vertical arm,
+    facing right (yaw=0) so left-wall-following picks up the path.
+    """
+    return -2.5, 5.0, 0.0
+
+
 def random_spawn():
     """Find a random valid spawn position via rejection sampling."""
     for _ in range(5000):
@@ -96,8 +106,14 @@ def random_spawn():
 def generate_launch_description():
     pkg_andino_gz = get_package_share_directory('andino_gz')
 
-    x, y, yaw = random_spawn()
-    print(f"[assignment1] Spawning robot at x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}")
+    #use_fixed = os.environ.get('FIXED_SPAWN', '').strip()
+    use_fixed = True if FIXED_SPAWN == 1 else False
+    if use_fixed and use_fixed != '0':
+        x, y, yaw = fixed_spawn()
+        print(f"[assignment1] FIXED spawn at x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}")
+    else:
+        x, y, yaw = random_spawn()
+        print(f"[assignment1] RANDOM spawn at x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}")
 
     # Inject into sys.argv so ParseMultiRobotPose picks it up
     robots_arg = f'robots:=andino={{x: {x:.3f}, y: {y:.3f}, z: {ROBOT_Z}, yaw: {yaw:.3f}}};'

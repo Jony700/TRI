@@ -85,11 +85,25 @@ The driving and wall-following logic also lives here. As of march 19th:
      4. `else`: Follows the wall on its left by constantly adjusting angular velocity based on `desired_dist = 1.5m`. This also works to avoid hitting walls inside the circle, but requires extra conditions to center and leave as requested in the guidelines. (*State machine*)
 
 > [!IMPORTANT]
-> **DevLog:** Terminator is recommended, as at least two simultaneous terminals are required to be running in paralell. 
+> **DevLog:** Terminator is recommended, as at least two simultaneous terminals are required to be running in paralell.
+
+
+## Launch Settings
+
+`assignment1.launch.py` works sort of like a config file here: it contains multiple functions to help maintain stability and higher control of the project. It features multiple different useful setups, like choosing whether the robot will start in a random or fixed position. 
+
+> [!IMPORTANT]
+> **DevLog:** It's not a mandatory read for development, but it's quite useful! 
 
 ## TODO
 
 1. Create optional fixed start position (useful for development)
 2. Create stop-center-turn-leave condition (requested in guidelines) 
 
+## Issues
+
+1. Theoretically, I've added both but none are working...
+2. Next implementation will incude debugging:
+     1. fixed start might not be getting triggered
+     2. centering condition is not working or regular wall follow is not being overridden by center_align
 
