@@ -26,6 +26,17 @@ mkdir src
 And clone the repository to `src`!
 
 
+> [!IMPORTANT]
+> **DevLog:** Remember to always build whenever any change is made to the project! Otherwise, commands will use the cached files instead of the new information.
+
+
+
+```bash
+cd ~/tri_ws
+source install/setup.bash
+colcon build
+```
+
 ## The World
 
 Our world was manually created without using Gazebo's GUI, for complete control of every parameter. By following this project structure:
