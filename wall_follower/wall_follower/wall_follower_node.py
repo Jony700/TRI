@@ -49,10 +49,10 @@ class WallFollowerNode(Node):
         self.declare_parameter('stop_confirmation_count', 15)
 
         # Declare parameters — centering & alignment
-        self.declare_parameter('center_tolerance', 0.3)
-        self.declare_parameter('centering_linear_speed', 0.08)
-        self.declare_parameter('centering_angular_speed', 0.3)
-        self.declare_parameter('align_angular_speed', 0.3)
+        self.declare_parameter('center_tolerance', 0.1)
+        self.declare_parameter('centering_linear_speed', 0.18)
+        self.declare_parameter('centering_angular_speed', 0.12)
+        self.declare_parameter('align_angular_speed', 0.6)
 
         # Read parameters — wall following
         self.desired_dist = self.get_parameter('desired_distance').value
@@ -81,6 +81,10 @@ class WallFollowerNode(Node):
         self.stop_confirm_count = 0
         self.align_cumulative_yaw = 0.0   # track total rotation during alignment
         self.align_prev_time = None
+        self.align_rotating = True        # True = rotating, False = driving out
+        self.align_done_180 = False       # True once first 180° spin is complete
+        self.has_been_outside = False     # must see open space before CENTERING allowed
+        self.prev_centering_cmd = Twist()  # EMA smoothing state for centering
 
         # Publishers & Subscribers
         self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
@@ -118,120 +122,196 @@ class WallFollowerNode(Node):
                 valid += 1
         return valid / len(msg.ranges) if msg.ranges else 0.0
 
+    def _count_inf_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> int:
+        """Count inf/out-of-range readings in angular sector."""
+        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_end   = int((angle_end   - msg.angle_min) / msg.angle_increment)
+        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
+        idx_end   = max(0, min(idx_end,   len(msg.ranges) - 1))
+        if idx_start > idx_end:
+            idx_start, idx_end = idx_end, idx_start
+        return sum(
+            1 for i in range(idx_start, idx_end + 1)
+            if math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
+               or msg.ranges[i] > msg.range_max
+        )
+
+    def _estimate_circle_center(self, msg: LaserScan):
+        """Estimate circle center from valid lidar wall hits.
+
+        Returns (cx, cy) in robot base_link frame and the count of points used.
+        The centroid of points on a circular wall approximates the circle center.
+        """
+        sum_x = 0.0
+        sum_y = 0.0
+        count = 0
+        for i, r in enumerate(msg.ranges):
+            if math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max:
+                continue
+            scan_angle = msg.angle_min + i * msg.angle_increment
+            # LiDAR is mounted rotated π from base_link
+            sum_x += -r * math.cos(scan_angle)
+            sum_y += -r * math.sin(scan_angle)
+            count += 1
+        if count == 0:
+            return 0.0, 0.0, 0
+        return sum_x / count, sum_y / count, count
+
     # ── Center & Align (Feature 2) ──────────────────────────────────
 
     def _center_and_align(self, msg: LaserScan) -> Twist:
         """Handle CENTERING and ALIGNING phases. Returns the Twist command.
 
-        CENTERING: measure 4 lidar sectors, filter inf, move away from shortest.
-                   Considers robot centered when all valid distances are within
-                   center_tolerance of each other.
+        CENTERING: direction from old logic (move away from closest sector),
+                   speed from new logic (ramp down by dist_to_circle_center),
+                   EMA smoothing on output to suppress jitter.
         ALIGNING:  rotate in place until front_left and front_right both read inf
                    (exit gap is ahead). Error after 2 full rotations.
         """
         cmd = Twist()
 
         if self.state == STATE_CENTERING:
-            # ── Measure 4 cardinal directions ───────────────────────
-            # NOTE: LiDAR is mounted rotated 180° (π) in the URDF.
-            #   Scan angle   0   = robot BACK
-            #   Scan angle  ±π   = robot FRONT
-            #   Scan angle  -π/2 = robot LEFT
-            #   Scan angle  +π/2 = robot RIGHT
-
+            # ── Measure 4 sectors (used for both exit check and direction) ──
             front_dist = min(
                 self._get_min_range_sector(msg, math.radians(135), math.radians(179)),
                 self._get_min_range_sector(msg, math.radians(-179), math.radians(-135))
             )
-            left_dist = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
-            right_dist = self._get_min_range_sector(msg, math.radians(60), math.radians(120))
-            back_dist = self._get_min_range_sector(msg, math.radians(-30), math.radians(30))
+            left_dist  = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
+            right_dist = self._get_min_range_sector(msg, math.radians(60),   math.radians(120))
+            back_dist  = self._get_min_range_sector(msg, math.radians(-30),  math.radians(30))
 
-            # ── Filter out infinity (requirement 2.1) ───────────────
-            directions = {
-                'front': front_dist,
-                'left': left_dist,
-                'right': right_dist,
-                'back': back_dist,
-            }
-            valid_dirs = {k: v for k, v in directions.items() if not math.isinf(v)}
+            valid_dists = [v for v in [front_dist, left_dist, right_dist, back_dist]
+                           if not math.isinf(v)]
 
-            if not valid_dirs:
-                # All inf — shouldn't happen inside circle, just stop
-                self.get_logger().warn('CENTERING: all lidar directions read inf, stopping.')
-                return cmd
-
-            # ── Check if centered (requirement 2.2) ─────────────────
-            dists = list(valid_dirs.values())
-            if max(dists) - min(dists) <= self.center_tolerance:
-                # Centered! Transition to alignment
+            # ── Centered check: max spread between valid sectors ────
+            if valid_dists and (max(valid_dists) - min(valid_dists)) <= self.center_tolerance:
                 self.state = STATE_ALIGNING
                 self.align_cumulative_yaw = 0.0
                 self.align_prev_time = None
+                self.align_rotating = True
+                self.align_done_180 = False
+                self.prev_centering_cmd = Twist()
                 self.get_logger().info(
-                    f'CENTERED (spread={max(dists) - min(dists):.2f}m <= '
+                    f'CENTERED (spread={max(valid_dists) - min(valid_dists):.3f}m <= '
                     f'{self.center_tolerance}m). Entering ALIGNING phase.')
-                return cmd  # one tick of zero-vel before aligning
+                return cmd
 
-            # ── Move away from shortest distance ────────────────────
+            # ── Speed: centroid distance ramps down near center ─────
+            cx, cy, n_pts = self._estimate_circle_center(msg)
+            dist_to_center = math.hypot(cx, cy) if n_pts > 0 else float('inf')
+
+            slowdown_radius = 0.5
+            if dist_to_center < slowdown_radius:
+                speed = self.centering_lin_spd * (dist_to_center / slowdown_radius)
+                speed = max(speed, 0.03)
+            else:
+                speed = self.centering_lin_spd
+
+            # ── Direction: move away from closest sector ─────────────
+            directions = {'front': front_dist, 'left': left_dist,
+                          'right': right_dist, 'back': back_dist}
+            valid_dirs = {k: v for k, v in directions.items() if not math.isinf(v)}
+
+            if not valid_dirs:
+                self.get_logger().warn('CENTERING: all lidar directions read inf, stopping.')
+                return cmd
+
             shortest_dir = min(valid_dirs, key=lambda k: valid_dirs[k])
+
+            raw = Twist()
+            if shortest_dir == 'front':
+                raw.linear.x = -speed
+            elif shortest_dir == 'back':
+                raw.linear.x = speed
+            elif shortest_dir == 'left':
+                raw.angular.z = -self.centering_ang_spd
+                raw.linear.x  = speed * 0.3
+            elif shortest_dir == 'right':
+                raw.angular.z = self.centering_ang_spd
+                raw.linear.x  = speed * 0.3
+
+            # ── EMA smoothing (α=0.35) to suppress jitter ─────────
+            alpha = 0.35
+            cmd.linear.x  = alpha * raw.linear.x  + (1 - alpha) * self.prev_centering_cmd.linear.x
+            cmd.angular.z = alpha * raw.angular.z + (1 - alpha) * self.prev_centering_cmd.angular.z
+            self.prev_centering_cmd = cmd
 
             self.get_logger().info(
                 f'CENTERING: F={front_dist:.2f} L={left_dist:.2f} '
-                f'R={right_dist:.2f} B={back_dist:.2f} | '
-                f'closest={shortest_dir} → moving away',
+                f'R={right_dist:.2f} B={back_dist:.2f} '
+                f'| closest={shortest_dir} center_dist={dist_to_center:.3f}m '
+                f'spd={cmd.linear.x:.3f} ang={cmd.angular.z:.3f}',
                 throttle_duration_sec=0.5)
-
-            # Move away from shortest direction
-            # Robot FRONT = +linear.x, LEFT = +angular.z, RIGHT = -angular.z
-            if shortest_dir == 'front':
-                cmd.linear.x = -self.centering_lin_spd   # reverse
-            elif shortest_dir == 'back':
-                cmd.linear.x = self.centering_lin_spd    # forward
-            elif shortest_dir == 'left':
-                cmd.angular.z = -self.centering_ang_spd  # turn right
-                cmd.linear.x = self.centering_lin_spd * 0.3
-            elif shortest_dir == 'right':
-                cmd.angular.z = self.centering_ang_spd   # turn left
-                cmd.linear.x = self.centering_lin_spd * 0.3
 
         elif self.state == STATE_ALIGNING:
-            # ── Align with exit (requirement 2.3) ───────────────────
-            # Front_left and front_right should read inf when facing the gap
-            front_left = self._get_min_range_sector(msg, math.radians(135), math.radians(179))
-            front_right = self._get_min_range_sector(msg, math.radians(-179), math.radians(-135))
+            if self.align_rotating:
+                now = self.get_clock().now()
+                if self.align_prev_time is not None:
+                    dt = max((now - self.align_prev_time).nanoseconds * 1e-9, 0.01)
+                    self.align_cumulative_yaw += abs(self.align_ang_spd) * dt
+                self.align_prev_time = now
 
-            aligned = math.isinf(front_left) and math.isinf(front_right)
+                # Failsafe: max 2 full rotations total
+                if self.align_cumulative_yaw >= 2 * 2 * math.pi:
+                    self.get_logger().error(
+                        f'ALIGNMENT FAILED: exceeded 2 rotations. Stopping.')
+                    self.state = STATE_DONE
+                    return cmd
 
-            # ── Track cumulative rotation for 2-rotation failsafe ───
-            now = self.get_clock().now()
-            if self.align_prev_time is not None:
-                dt = max((now - self.align_prev_time).nanoseconds * 1e-9, 0.01)
-                self.align_cumulative_yaw += abs(self.align_ang_spd) * dt
-            self.align_prev_time = now
+                if not self.align_done_180:
+                    # ── Sub-phase 1a: spin 180° unconditionally ──────
+                    if self.align_cumulative_yaw >= math.radians(120):
+                        self.align_done_180 = True
+                        self.get_logger().info(
+                            f'180° done. Starting balance check.')
+                    cmd.angular.z = self.align_ang_spd
+                    self.get_logger().info(
+                        f'ALIGNING spin: {math.degrees(self.align_cumulative_yaw):.0f}°/120°',
+                        throttle_duration_sec=0.5)
+                else:
+                    # ── Sub-phase 1b: rotate until L/R inf balanced ──
+                    # LiDAR rotated 180°: front-left = scan -90°..-180°,
+                    #                     front-right = scan +90°..+180°
+                    left_inf  = self._count_inf_sector(
+                        msg, math.radians(-180), math.radians(-90))
+                    right_inf = self._count_inf_sector(
+                        msg, math.radians(90),  math.radians(180))
+                    total_inf = left_inf + right_inf
+                    margin    = max(1, int(0.1 * total_inf))
 
-            max_rotations = 2
-            if self.align_cumulative_yaw >= max_rotations * 2 * math.pi:
-                self.get_logger().error(
-                    f'ALIGNMENT FAILED: exceeded {max_rotations} full rotations '
-                    f'({self.align_cumulative_yaw:.1f} rad). '
-                    f'Adjust alignment angle parameters. Stopping.')
-                self.state = STATE_DONE
-                return cmd
+                    if total_inf >= 5 and abs(left_inf - right_inf) <= margin:
+                        self.align_rotating = False
+                        self.get_logger().info(
+                            f'Inf balanced: L={left_inf} R={right_inf} '
+                            f'(margin={margin}) after '
+                            f'{math.degrees(self.align_cumulative_yaw):.0f}°. Driving out.')
+                        return cmd
 
-            if aligned:
-                self.state = STATE_DONE
+                    # Rotate toward the side with more inf (gap is there)
+                    if right_inf > left_inf:
+                        cmd.angular.z = -self.align_ang_spd
+                    else:
+                        cmd.angular.z = self.align_ang_spd
+
+                    self.get_logger().info(
+                        f'ALIGNING balance: L={left_inf} R={right_inf} '
+                        f'diff={abs(left_inf - right_inf)} margin={margin} '
+                        f'yaw={math.degrees(self.align_cumulative_yaw):.0f}°',
+                        throttle_duration_sec=0.5)
+
+            else:
+                # ── Phase 2: drive forward until exited circle ───────
+                ratio = self._valid_reading_ratio(msg)
+                if ratio < self.inside_ratio:
+                    self.state = STATE_DONE
+                    self.get_logger().info(
+                        f'EXITED circle ({ratio:.0%} valid readings). DONE.')
+                    return cmd
+
+                cmd.linear.x = self.forward_speed
                 self.get_logger().info(
-                    'ALIGNED with exit! front_left=inf, front_right=inf. Stopping.')
-                return cmd
-
-            # Rotate in place (positive = turn left)
-            cmd.angular.z = self.align_ang_spd
-
-            self.get_logger().info(
-                f'ALIGNING: front_L={front_left:.2f} front_R={front_right:.2f} '
-                f'yaw_total={self.align_cumulative_yaw:.1f}rad',
-                throttle_duration_sec=0.5)
+                    f'ALIGNING: driving out, valid={ratio:.0%}',
+                    throttle_duration_sec=0.5)
 
         return cmd
 
@@ -254,8 +334,13 @@ class WallFollowerNode(Node):
 
         # ── Check if inside the circle ──────────────────────────────
         # When >60% of lidar readings see a wall, we're inside → centering.
+        # Guard: robot must have seen open space first (has_been_outside),
+        # so a corridor at startup never triggers CENTERING prematurely.
         ratio = self._valid_reading_ratio(msg)
-        if ratio >= self.inside_ratio:
+        if ratio < self.inside_ratio:
+            self.has_been_outside = True
+            self.stop_confirm_count = 0
+        elif self.has_been_outside:
             self.stop_confirm_count += 1
             self.get_logger().info(
                 f'INSIDE CHECK {self.stop_confirm_count}/{self.stop_confirm_needed} '
@@ -267,8 +352,6 @@ class WallFollowerNode(Node):
                     f'Starting CENTERING phase.')
                 self.cmd_pub.publish(Twist())
                 return
-        else:
-            self.stop_confirm_count = 0
 
         # ── Measure key sectors ─────────────────────────────────────
         # NOTE: LiDAR is mounted rotated 180° (π) in the URDF.
@@ -322,8 +405,8 @@ class WallFollowerNode(Node):
             angular_z = self.kp * error + self.kd * d_error
             angular_z = max(-1.0, min(1.0, angular_z))  # clamp
 
-            # Slow down when turning hard or approaching front wall
-            speed_scale = max(0.3, 1.0 - abs(angular_z) * 0.5)
+            # Boost when going straight, slow down when turning hard
+            speed_scale = max(0.3, min(1.5, 1.5 - abs(angular_z)))
             if front_dist < self.front_slow_dist:
                 # Progressive slowdown as we approach a front wall
                 front_scale = max(0.1, (front_dist - self.front_obs_dist) / (self.front_slow_dist - self.front_obs_dist))
