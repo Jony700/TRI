@@ -37,7 +37,10 @@ class WallFollowerNode(Node):
 
         # Declare parameters — wall following
         self.declare_parameter('desired_distance', 1.5)
-        self.declare_parameter('forward_speed', 0.15)
+        self.declare_parameter('base_speed', 0.2)
+        self.declare_parameter('forward_speed', 0.5)
+        self.declare_parameter('accel', 0.1)
+        self.declare_parameter('accel_angular_threshold', 0.3)
         self.declare_parameter('kp', 1.2)
         self.declare_parameter('kd', 0.4)
         self.declare_parameter('front_obstacle_dist', 0.8)
@@ -56,7 +59,10 @@ class WallFollowerNode(Node):
 
         # Read parameters — wall following
         self.desired_dist = self.get_parameter('desired_distance').value
+        self.base_speed   = self.get_parameter('base_speed').value
         self.forward_speed = self.get_parameter('forward_speed').value
+        self.accel        = self.get_parameter('accel').value
+        self.accel_ang_thresh = self.get_parameter('accel_angular_threshold').value
         self.kp = self.get_parameter('kp').value
         self.kd = self.get_parameter('kd').value
         self.front_obs_dist = self.get_parameter('front_obstacle_dist').value
@@ -84,6 +90,8 @@ class WallFollowerNode(Node):
         self.align_rotating = True        # True = rotating, False = driving out
         self.align_done_180 = False       # True once first 180° spin is complete
         self.has_been_outside = False     # must see open space before CENTERING allowed
+        self.current_speed  = self.base_speed   # tracked speed for acceleration
+        self.prev_left_avg  = None              # for curve detection
         self.prev_centering_cmd = Twist()  # EMA smoothing state for centering
 
         # Publishers & Subscribers
@@ -121,6 +129,19 @@ class WallFollowerNode(Node):
             if not (math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max):
                 valid += 1
         return valid / len(msg.ranges) if msg.ranges else 0.0
+
+    def _get_avg_range_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> float:
+        """Get mean valid range in angular sector. Returns inf if no valid readings."""
+        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_end   = int((angle_end   - msg.angle_min) / msg.angle_increment)
+        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
+        idx_end   = max(0, min(idx_end,   len(msg.ranges) - 1))
+        if idx_start > idx_end:
+            idx_start, idx_end = idx_end, idx_start
+        valid = [msg.ranges[i] for i in range(idx_start, idx_end + 1)
+                 if not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
+                         or msg.ranges[i] < msg.range_min or msg.ranges[i] > msg.range_max)]
+        return sum(valid) / len(valid) if valid else float('inf')
 
     def _count_inf_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> int:
         """Count inf/out-of-range readings in angular sector."""
@@ -202,10 +223,10 @@ class WallFollowerNode(Node):
 
             slowdown_radius = 0.5
             if dist_to_center < slowdown_radius:
-                speed = self.centering_lin_spd * (dist_to_center / slowdown_radius)
+                speed = self.base_speed * (dist_to_center / slowdown_radius)
                 speed = max(speed, 0.03)
             else:
-                speed = self.centering_lin_spd
+                speed = self.base_speed
 
             # ── Direction: move away from closest sector ─────────────
             directions = {'front': front_dist, 'left': left_dist,
@@ -308,7 +329,7 @@ class WallFollowerNode(Node):
                         f'EXITED circle ({ratio:.0%} valid readings). DONE.')
                     return cmd
 
-                cmd.linear.x = self.forward_speed
+                cmd.linear.x = self.base_speed
                 self.get_logger().info(
                     f'ALIGNING: driving out, valid={ratio:.0%}',
                     throttle_duration_sec=0.5)
@@ -383,7 +404,7 @@ class WallFollowerNode(Node):
 
         elif wall_dist > self.max_search_dist:
             # NO WALL FOUND: drive forward and gently turn left to find one
-            cmd.linear.x = self.forward_speed
+            cmd.linear.x = self.base_speed
             cmd.angular.z = 0.3  # positive = turn left in ROS
             self.prev_error = 0.0
             self.get_logger().info(
@@ -405,20 +426,39 @@ class WallFollowerNode(Node):
             angular_z = self.kp * error + self.kd * d_error
             angular_z = max(-1.0, min(1.0, angular_z))  # clamp
 
-            # Boost when going straight, slow down when turning hard
-            speed_scale = max(0.3, min(1.5, 1.5 - abs(angular_z)))
+            # ── Speed: accelerate when conditions met, else base_speed ──
+            left_has_inf = self._count_inf_sector(
+                msg, math.radians(-120), math.radians(-60)) > 0
+            left_avg = self._get_avg_range_sector(
+                msg, math.radians(-120), math.radians(-60))
+            left_curving = (self.prev_left_avg is not None and
+                            not math.isinf(left_avg) and
+                            left_avg - self.prev_left_avg > 0.03)
+            self.prev_left_avg = left_avg
+            can_accel = (not left_has_inf and not left_curving
+                         and abs(angular_z) < self.accel_ang_thresh)
+
+            dt_spd = dt  # reuse dt already computed above
+            if can_accel:
+                self.current_speed = min(
+                    self.forward_speed,
+                    self.current_speed + self.accel * dt_spd)
+            else:
+                self.current_speed = self.base_speed
+
+            speed = self.current_speed
             if front_dist < self.front_slow_dist:
-                # Progressive slowdown as we approach a front wall
-                front_scale = max(0.1, (front_dist - self.front_obs_dist) / (self.front_slow_dist - self.front_obs_dist))
-                speed_scale *= front_scale
-                # Also start turning right as we approach
+                front_scale = max(0.1, (front_dist - self.front_obs_dist) /
+                                  (self.front_slow_dist - self.front_obs_dist))
+                speed *= front_scale
                 angular_z = min(angular_z, -0.3)
-            cmd.linear.x = self.forward_speed * speed_scale
+            cmd.linear.x = speed
             cmd.angular.z = angular_z
 
             self.get_logger().info(
                 f'FOLLOWING left={wall_dist:.2f}m err={error:+.2f} '
-                f'ang={angular_z:+.2f} spd={cmd.linear.x:.2f}',
+                f'ang={angular_z:+.2f} spd={cmd.linear.x:.2f} '
+                f'{"[INF]" if left_has_inf else "[CRV]" if left_curving else "[ACC]"}',
                 throttle_duration_sec=1.0)
 
         self.prev_time = now

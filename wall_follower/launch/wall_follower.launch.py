@@ -11,7 +11,9 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'desired_distance': 1.0,
-                'forward_speed': 0.15,
+                'base_speed': 0.2,
+                'forward_speed': 0.5,
+                'accel': 0.1,
                 'kp': 1.5,
                 'kd': 0.5,
                 'front_obstacle_dist': 0.5,
