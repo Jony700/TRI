@@ -9,7 +9,7 @@
       name="gz::sim::systems::DiffDrive">
       <left_joint>left_wheel_joint</left_joint>
       <right_joint>right_wheel_joint</right_joint>
-      <wheel_separation>0.137</wheel_separation>
+      <wheel_separation>0.16</wheel_separation>
       <wheel_radius>0.033</wheel_radius>
       <!--
       Odometry in the diff drive plugin is quite bad, therefore

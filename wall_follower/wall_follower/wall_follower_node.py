@@ -36,10 +36,10 @@ class WallFollowerNode(Node):
         super().__init__('wall_follower')
 
         # Declare parameters — wall following
-        self.declare_parameter('desired_distance', 1.5)
-        self.declare_parameter('base_speed', 0.2)
-        self.declare_parameter('forward_speed', 0.5)
-        self.declare_parameter('accel', 0.1)
+        self.declare_parameter('desired_distance', 1.0)
+        self.declare_parameter('base_speed', 0.5)
+        self.declare_parameter('forward_speed', 4.0)
+        self.declare_parameter('accel', 0.4)
         self.declare_parameter('accel_angular_threshold', 0.3)
         self.declare_parameter('kp', 1.2)
         self.declare_parameter('kd', 0.4)
@@ -53,7 +53,7 @@ class WallFollowerNode(Node):
 
         # Declare parameters — centering & alignment
         self.declare_parameter('center_tolerance', 0.1)
-        self.declare_parameter('centering_linear_speed', 0.18)
+        self.declare_parameter('centering_linear_speed', 0.2)
         self.declare_parameter('centering_angular_speed', 0.12)
         self.declare_parameter('align_angular_speed', 0.6)
 
@@ -93,6 +93,15 @@ class WallFollowerNode(Node):
         self.current_speed  = self.base_speed   # tracked speed for acceleration
         self.prev_left_avg  = None              # for curve detection
         self.prev_centering_cmd = Twist()  # EMA smoothing state for centering
+
+        # Spiral search state
+        self._spiral_lin_speed  = 0.0       # current forward speed of the spiral arm
+        self._spiral_yaw_accum  = 0.0       # yaw accumulated in the current arm
+        self._spiral_arm_count  = 0         # number of completed half-turn arms
+        self._spiral_prev_time  = None      # last timestamp (for dt integration)
+        self._spiral_ang_speed  = 0.5       # fixed rotation rate (rad/s) – positive = CCW
+        self._spiral_lin_step   = 0.04      # linear speed added each half-revolution
+        self._spiral_lin_max    = self.forward_speed  # cap
 
         # Publishers & Subscribers
         self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
@@ -223,10 +232,10 @@ class WallFollowerNode(Node):
 
             slowdown_radius = 0.5
             if dist_to_center < slowdown_radius:
-                speed = self.base_speed * (dist_to_center / slowdown_radius)
+                speed = self.centering_lin_spd * (dist_to_center / slowdown_radius)
                 speed = max(speed, 0.03)
             else:
-                speed = self.base_speed
+                speed = self.centering_lin_spd
 
             # ── Direction: move away from closest sector ─────────────
             directions = {'front': front_dist, 'left': left_dist,
@@ -329,7 +338,7 @@ class WallFollowerNode(Node):
                         f'EXITED circle ({ratio:.0%} valid readings). DONE.')
                     return cmd
 
-                cmd.linear.x = self.base_speed
+                cmd.linear.x = self.centering_lin_spd
                 self.get_logger().info(
                     f'ALIGNING: driving out, valid={ratio:.0%}',
                     throttle_duration_sec=0.5)
@@ -399,18 +408,54 @@ class WallFollowerNode(Node):
             cmd.linear.x = 0.0
             cmd.angular.z = -1.0
             self.prev_error = 0.0
+            # Reset spiral state so the next search starts fresh
+            self._spiral_lin_speed = 0.0
+            self._spiral_yaw_accum = 0.0
+            self._spiral_arm_count = 0
+            self._spiral_prev_time = None
             self.get_logger().info(
                 f'FRONT OBSTACLE {front_dist:.2f}m — turning right', throttle_duration_sec=0.5)
 
         elif wall_dist > self.max_search_dist:
-            # NO WALL FOUND: drive forward and gently turn left to find one
-            cmd.linear.x = self.base_speed
-            cmd.angular.z = 0.3  # positive = turn left in ROS
+            # NO WALL FOUND: expanding spiral search.
+            # Each half-revolution the linear (outward) speed increases,
+            # widening the spiral until any reading becomes finite.
             self.prev_error = 0.0
+
+            # --- integrate yaw for the current arm ---
+            spiral_now = self.get_clock().now()
+            if self._spiral_prev_time is not None:
+                spiral_dt = max(
+                    (spiral_now - self._spiral_prev_time).nanoseconds * 1e-9, 0.001)
+                self._spiral_yaw_accum += abs(self._spiral_ang_speed) * spiral_dt
+            self._spiral_prev_time = spiral_now
+
+            # After π radians (half revolution) → complete one arm, increase speed
+            if self._spiral_yaw_accum >= math.pi:
+                self._spiral_yaw_accum -= math.pi   # keep remainder
+                self._spiral_arm_count += 1
+                self._spiral_lin_speed = min(
+                    self._spiral_lin_max,
+                    self._spiral_lin_step * self._spiral_arm_count
+                )
+                self.get_logger().info(
+                    f'SPIRAL arm {self._spiral_arm_count}: '
+                    f'lin_speed={self._spiral_lin_speed:.3f} m/s')
+
+            cmd.linear.x  = self._spiral_lin_speed
+            cmd.angular.z = self._spiral_ang_speed
             self.get_logger().info(
-                f'SEARCHING for left wall (left={left_dist:.2f}m)', throttle_duration_sec=1.0)
+                f'SPIRAL SEARCH arm={self._spiral_arm_count} '
+                f'yaw={math.degrees(self._spiral_yaw_accum):.0f}° '
+                f'lin={self._spiral_lin_speed:.3f} left={left_dist:.2f}m',
+                throttle_duration_sec=1.0)
 
         else:
+            # Wall found — reset spiral state for the next time we lose it
+            self._spiral_lin_speed = 0.0
+            self._spiral_yaw_accum = 0.0
+            self._spiral_arm_count = 0
+            self._spiral_prev_time = None
             # WALL FOLLOWING with PD control
             # error > 0 means too far from wall → turn left (positive angular.z)
             # error < 0 means too close → turn right (negative angular.z)
@@ -426,25 +471,61 @@ class WallFollowerNode(Node):
             angular_z = self.kp * error + self.kd * d_error
             angular_z = max(-1.0, min(1.0, angular_z))  # clamp
 
-            # ── Speed: accelerate when conditions met, else base_speed ──
-            left_has_inf = self._count_inf_sector(
-                msg, math.radians(-120), math.radians(-60)) > 0
+            # ── Speed: proportional cap from left-sector validity ──────
+            # Count how many rays in the left window are finite.
+            left_idx_start = int((math.radians(-120) - msg.angle_min) / msg.angle_increment)
+            left_idx_end   = int((math.radians(-60)  - msg.angle_min) / msg.angle_increment)
+            left_idx_start = max(0, min(left_idx_start, len(msg.ranges) - 1))
+            left_idx_end   = max(0, min(left_idx_end,   len(msg.ranges) - 1))
+            if left_idx_start > left_idx_end:
+                left_idx_start, left_idx_end = left_idx_end, left_idx_start
+            left_total = left_idx_end - left_idx_start + 1
+            left_valid = sum(
+                1 for i in range(left_idx_start, left_idx_end + 1)
+                if not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
+                        or msg.ranges[i] < msg.range_min or msg.ranges[i] > msg.range_max)
+            )
+            # valid_ratio in [0, 1]; scales the max speed ceiling proportionally.
+            left_valid_ratio = left_valid / left_total if left_total > 0 else 1.0
+            
+            # Reductions are same factor but weighted by 0.5 for infs (missing readings).
+            # E.g. if 90% valid -> 10% missing * 0.5 = 5% speed reduction.
+            reduction_factor = (1.0 - left_valid_ratio) * 1.5
+            speed_multiplier = max(0.0, 1.0 - reduction_factor)
+            
+            # Reduce speed by an inverse factor of the angular speed
+            speed_multiplier *= max(0.0, 1.0 - abs(angular_z))
+            
+            speed_ceiling = self.forward_speed * speed_multiplier
+            # Never go below base_speed as ceiling (avoid stalling on a momentary blip).
+            speed_ceiling = max(speed_ceiling, self.base_speed)
+
+            left_has_inf = left_valid < left_total   # kept for logging
             left_avg = self._get_avg_range_sector(
                 msg, math.radians(-120), math.radians(-60))
             left_curving = (self.prev_left_avg is not None and
                             not math.isinf(left_avg) and
                             left_avg - self.prev_left_avg > 0.03)
             self.prev_left_avg = left_avg
-            can_accel = (not left_has_inf and not left_curving
-                         and abs(angular_z) < self.accel_ang_thresh)
+
+            # Accelerate up to the proportional ceiling; slow-down on curves/steering/distance error.
+            # Only accelerate if the distance to the wall is >= 0.95m
+            can_accel = (not left_curving and 
+                         abs(angular_z) < self.accel_ang_thresh and 
+                         wall_dist >= 0.95)
 
             dt_spd = dt  # reuse dt already computed above
             if can_accel:
                 self.current_speed = min(
-                    self.forward_speed,
+                    speed_ceiling,
                     self.current_speed + self.accel * dt_spd)
             else:
-                self.current_speed = self.base_speed
+                # Ramp down toward base_speed (not a hard jump).
+                self.current_speed = max(
+                    self.base_speed,
+                    self.current_speed - self.accel * dt_spd)
+            # Also clamp in case ceiling just dropped below current speed.
+            self.current_speed = min(self.current_speed, speed_ceiling)
 
             speed = self.current_speed
             if front_dist < self.front_slow_dist:
@@ -458,7 +539,8 @@ class WallFollowerNode(Node):
             self.get_logger().info(
                 f'FOLLOWING left={wall_dist:.2f}m err={error:+.2f} '
                 f'ang={angular_z:+.2f} spd={cmd.linear.x:.2f} '
-                f'{"[INF]" if left_has_inf else "[CRV]" if left_curving else "[ACC]"}',
+                f'left_valid={left_valid_ratio:.0%} ceil={speed_ceiling:.2f} '
+                f'{"[CRV]" if left_curving else "[ACC]"}',
                 throttle_duration_sec=1.0)
 
         self.prev_time = now

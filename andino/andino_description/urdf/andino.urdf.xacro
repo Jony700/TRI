@@ -38,12 +38,12 @@
   <xacro:footprint wheel_props="${wheel_props}" />
 
   <!-- Base link -->
-  <xacro:base link_name="base_link" base_prop="${base_props}" mesh="${base_props['base']['mesh']}" >
+  <xacro:base link_name="base_link" base_prop="${base_props}" mesh="${base_props['base']['mesh']}" radius="${base_props['base']['radius']}" >
     <origin xyz="0 0 0" rpy="0 0 0" />
   </xacro:base>
 
   <!-- Second story link -->
-  <xacro:base link_name="second_base_link" base_prop="${second_base_props}" mesh="${second_base_props['base']['mesh']}" >
+  <xacro:base link_name="second_base_link" base_prop="${second_base_props}" mesh="${second_base_props['base']['mesh']}" radius="${second_base_props['base']['radius']}" >
     <origin xyz="0 0 0.05" rpy="0 0 0" />
   </xacro:base>
   <!-- Joint to connect second_story with base_link -->

@@ -3,6 +3,6 @@ radius: 0.0331    # Wheel radius in m
 length: 0.025     # Wheel length in m, considering is as a cylinder
 mesh: '../components/wheel.stl'  # Leave it empty ('') to have a red wheel
 scale: ''
-x_offset: 0.079
-y_offset: 0.015
+x_offset: 0.1     # = base radius, places wheels at x=0 (center of round base)
+y_offset: -0.0325 # pulls wheels inward so separation = 0.16m
 z_offset: -0.017

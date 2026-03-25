@@ -1,6 +1,7 @@
 base:
   mass: 0.8               # Base mass in Kg
-  x_size: 0.195           # Dimension in x axis
-  y_size: 0.08            # Dimension in y axis
-  z_size: 0.005           # Dimension in z axis
-  mesh: 'chassis.stl'  # Name of the mesh files. Leave it empty ('') to have a white base.
+  radius: 0.1             # Base radius in m (round robot)
+  x_size: 0.2             # = 2*radius, used for wheel positioning
+  y_size: 0.2             # = 2*radius, used for wheel positioning
+  z_size: 0.05            # Base height in m
+  mesh: ''                # Leave empty to use cylinder primitive

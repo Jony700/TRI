@@ -145,13 +145,23 @@
   - origin [block]: origin, position and orientation of the link;
 -->
   <xacro:macro name="base"
-               params="link_name:='base_link' base_prop mesh:='' scale:='' *origin ">
+               params="link_name:='base_link' base_prop mesh:='' scale:='' radius:='' *origin ">
     <link name="${link_name}">
-    <xacro:box_inertia m="${base_prop['base']['mass']}"
-                       x="${base_prop['base']['x_size']}"
-                       y="${base_prop['base']['y_size']}"
-                       z="${base_prop['base']['z_size']}"> 
-    </xacro:box_inertia>
+    <xacro:if value="${radius != ''}">
+      <xacro:cylinder_inertia m="${base_prop['base']['mass']}"
+                               r="${radius}"
+                               l="${base_prop['base']['z_size']}"
+                               o_xyz="0.0 0.0 0.0"
+                               o_rpy="0.0 0.0 0.0">
+      </xacro:cylinder_inertia>
+    </xacro:if>
+    <xacro:unless value="${radius != ''}">
+      <xacro:box_inertia m="${base_prop['base']['mass']}"
+                         x="${base_prop['base']['x_size']}"
+                         y="${base_prop['base']['y_size']}"
+                         z="${base_prop['base']['z_size']}">
+      </xacro:box_inertia>
+    </xacro:unless>
     <xacro:if value="${mesh != '' }" >
       <visual>
         <xacro:insert_block name="origin" />
@@ -171,7 +181,12 @@
       <visual>
         <xacro:insert_block name="origin" />
         <geometry>
-          <box size="${base_prop['base']['x_size']} ${base_prop['base']['y_size']} ${base_prop['base']['z_size']}"/>
+          <xacro:if value="${radius != ''}">
+            <cylinder radius="${radius}" length="${base_prop['base']['z_size']}"/>
+          </xacro:if>
+          <xacro:unless value="${radius != ''}">
+            <box size="${base_prop['base']['x_size']} ${base_prop['base']['y_size']} ${base_prop['base']['z_size']}"/>
+          </xacro:unless>
         </geometry>
         <material name="blue" />
       </visual>
@@ -179,7 +194,12 @@
     <collision>
       <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
       <geometry>
-        <box size="${base_prop['base']['x_size']} ${base_prop['base']['y_size']} ${base_prop['base']['z_size']}"/>
+        <xacro:if value="${radius != ''}">
+          <cylinder radius="${radius}" length="${base_prop['base']['z_size']}"/>
+        </xacro:if>
+        <xacro:unless value="${radius != ''}">
+          <box size="${base_prop['base']['x_size']} ${base_prop['base']['y_size']} ${base_prop['base']['z_size']}"/>
+        </xacro:unless>
       </geometry>
     </collision>
     </link>
