@@ -528,6 +528,13 @@ class WallFollowerNode(Node):
             self.current_speed = min(self.current_speed, speed_ceiling)
 
             speed = self.current_speed
+            
+            # Early brake for circle approach: >50% valid lidars and front wall visible
+            ratio_overall = self._valid_reading_ratio(msg)
+            if ratio_overall > 0.5 and not math.isinf(front_dist):
+                speed = min(speed, 0.15)
+                self.current_speed = min(self.current_speed, 0.15)
+                
             if front_dist < self.front_slow_dist:
                 front_scale = max(0.1, (front_dist - self.front_obs_dist) /
                                   (self.front_slow_dist - self.front_obs_dist))
