@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""Left wall-following node using LiDAR for the Andino robot.
+"""Purely reactive left wall-following node using LiDAR for the Andino robot.
 
 Subscribes to /scan (LaserScan) and publishes /cmd_vel (Twist).
 Uses a PD controller to maintain a desired distance from the left wall.
 
-State machine:
-  1. WALL_FOLLOWING  – PD left-wall following until inside the circle
-  2. CENTERING       – move away from closest wall until centered
-  3. ALIGNING        – rotate until exit gap is directly ahead
-  4. DONE            – stopped, aligned with exit
+Architecture: fully reactive — no state machine, no memory beyond PD
+derivative term (prev_error, prev_time). Every scan produces a command
+from scratch based only on current sensor readings.
+
+Decision priority (per scan):
+  1. Front obstacle  → stop + turn right
+  2. Inside circle   → centroid-based centering / stop
+  3. No wall visible → fixed linear + angular (search)
+  4. Wall visible    → PD wall following
+
+LiDAR is mounted rotated pi from base_link:
+  scan 0      = robot BACK
+  scan +-pi   = robot FRONT
+  scan -pi/2  = robot LEFT
+  scan +pi/2  = robot RIGHT
 """
 
 import math
@@ -18,447 +28,206 @@ from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 
 
-
-"""
-DevNotes: I chose to move away from shortest distance instead of toward
-longest distance, because that would cause problems with inf
-"""
-
-# ── Robot states ────────────────────────────────────────────────────
-STATE_WALL_FOLLOWING = 'WALL_FOLLOWING'
-STATE_CENTERING = 'CENTERING'
-STATE_ALIGNING = 'ALIGNING'
-STATE_DONE = 'DONE'
-
-
 class WallFollowerNode(Node):
     def __init__(self):
         super().__init__('wall_follower')
 
-        # Declare parameters — wall following
+        # ── Parameters ────────────────────────────────────────────────
         self.declare_parameter('desired_distance', 1.0)
         self.declare_parameter('base_speed', 0.5)
-        self.declare_parameter('forward_speed', 4.0)
-        self.declare_parameter('accel', 0.4)
-        self.declare_parameter('accel_angular_threshold', 0.3)
+        self.declare_parameter('forward_speed', 1.0)
         self.declare_parameter('kp', 1.2)
         self.declare_parameter('kd', 0.4)
+        self.declare_parameter('kv', 0.3)
         self.declare_parameter('front_obstacle_dist', 0.8)
-        self.declare_parameter('front_slowdown_dist', 1.5)
         self.declare_parameter('max_wall_search_dist', 3.0)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('inside_ratio_threshold', 0.6)
-        self.declare_parameter('stop_confirmation_count', 15)
-
-        # Declare parameters — centering & alignment
         self.declare_parameter('center_tolerance', 0.1)
-        self.declare_parameter('centering_linear_speed', 0.2)
-        self.declare_parameter('centering_angular_speed', 0.12)
-        self.declare_parameter('align_angular_speed', 0.6)
+        self.declare_parameter('centering_speed', 0.15)
+        self.declare_parameter('search_linear_speed', 0.3)
+        self.declare_parameter('search_angular_speed', 0.5)
 
-        # Read parameters — wall following
-        self.desired_dist = self.get_parameter('desired_distance').value
-        self.base_speed   = self.get_parameter('base_speed').value
-        self.forward_speed = self.get_parameter('forward_speed').value
-        self.accel        = self.get_parameter('accel').value
-        self.accel_ang_thresh = self.get_parameter('accel_angular_threshold').value
-        self.kp = self.get_parameter('kp').value
-        self.kd = self.get_parameter('kd').value
-        self.front_obs_dist = self.get_parameter('front_obstacle_dist').value
-        self.front_slow_dist = self.get_parameter('front_slowdown_dist').value
-        self.max_search_dist = self.get_parameter('max_wall_search_dist').value
-        self.inside_ratio = self.get_parameter('inside_ratio_threshold').value
-        self.stop_confirm_needed = self.get_parameter('stop_confirmation_count').value
-
-        # Read parameters — centering & alignment
+        # Read parameters
+        self.desired_dist     = self.get_parameter('desired_distance').value
+        self.base_speed       = self.get_parameter('base_speed').value
+        self.forward_speed    = self.get_parameter('forward_speed').value
+        self.kp               = self.get_parameter('kp').value
+        self.kd               = self.get_parameter('kd').value
+        self.kv               = self.get_parameter('kv').value
+        self.front_obs_dist   = self.get_parameter('front_obstacle_dist').value
+        self.max_search_dist  = self.get_parameter('max_wall_search_dist').value
+        self.inside_ratio     = self.get_parameter('inside_ratio_threshold').value
         self.center_tolerance = self.get_parameter('center_tolerance').value
-        self.centering_lin_spd = self.get_parameter('centering_linear_speed').value
-        self.centering_ang_spd = self.get_parameter('centering_angular_speed').value
-        self.align_ang_spd = self.get_parameter('align_angular_speed').value
+        self.centering_speed  = self.get_parameter('centering_speed').value
+        self.search_lin_spd   = self.get_parameter('search_linear_speed').value
+        self.search_ang_spd   = self.get_parameter('search_angular_speed').value
 
         scan_topic = self.get_parameter('scan_topic').value
-        cmd_topic = self.get_parameter('cmd_vel_topic').value
+        cmd_topic  = self.get_parameter('cmd_vel_topic').value
 
-        # State
-        self.state = STATE_WALL_FOLLOWING
+        # ── Only PD memory (allowed by reactive architecture) ─────────
         self.prev_error = 0.0
-        self.prev_time = None
-        self.stop_confirm_count = 0
-        self.align_cumulative_yaw = 0.0   # track total rotation during alignment
-        self.align_prev_time = None
-        self.align_rotating = True        # True = rotating, False = driving out
-        self.align_done_180 = False       # True once first 180° spin is complete
-        self.has_been_outside = False     # must see open space before CENTERING allowed
-        self.current_speed  = self.base_speed   # tracked speed for acceleration
-        self.prev_left_avg  = None              # for curve detection
-        self.prev_centering_cmd = Twist()  # EMA smoothing state for centering
+        self.prev_time  = None
 
-        # Spiral search state
-        self._spiral_lin_speed  = 0.0       # current forward speed of the spiral arm
-        self._spiral_yaw_accum  = 0.0       # yaw accumulated in the current arm
-        self._spiral_arm_count  = 0         # number of completed half-turn arms
-        self._spiral_prev_time  = None      # last timestamp (for dt integration)
-        self._spiral_ang_speed  = 0.5       # fixed rotation rate (rad/s) – positive = CCW
-        self._spiral_lin_step   = 0.04      # linear speed added each half-revolution
-        self._spiral_lin_max    = self.forward_speed  # cap
-
-        # Publishers & Subscribers
-        self.cmd_pub = self.create_publisher(Twist, cmd_topic, 10)
-        self.scan_sub = self.create_subscription(LaserScan, scan_topic, self.scan_callback, 10)
+        # ── Publishers & Subscribers ──────────────────────────────────
+        self.cmd_pub  = self.create_publisher(Twist, cmd_topic, 10)
+        self.scan_sub = self.create_subscription(
+            LaserScan, scan_topic, self.scan_callback, 10)
 
         self.get_logger().info(
-            f'Wall follower started: desired_dist={self.desired_dist}m, '
-            f'speed={self.forward_speed}m/s, kp={self.kp}, kd={self.kd}'
-        )
+            f'Wall follower (reactive) started: desired_dist={self.desired_dist}m, '
+            f'speed={self.forward_speed}m/s, kp={self.kp}, kd={self.kd}')
 
-    # ── Helpers ──────────────────────────────────────────────────────
+    # ── Helpers (all per-scan, no state) ──────────────────────────────
 
-    def _get_min_range_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> float:
-        """Get minimum valid range in angular sector [angle_start, angle_end] in radians."""
-        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
-        idx_end = int((angle_end - msg.angle_min) / msg.angle_increment)
-        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
-        idx_end = max(0, min(idx_end, len(msg.ranges) - 1))
-        if idx_start > idx_end:
-            idx_start, idx_end = idx_end, idx_start
+    @staticmethod
+    def _is_valid(r, msg):
+        return not (math.isinf(r) or math.isnan(r)
+                    or r < msg.range_min or r > msg.range_max)
 
-        valid_ranges = []
-        for i in range(idx_start, idx_end + 1):
-            r = msg.ranges[i]
-            if not (math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max):
-                valid_ranges.append(r)
+    def _get_min_range_sector(self, msg, angle_start, angle_end):
+        """Minimum valid range in [angle_start, angle_end] (radians)."""
+        idx_s = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_e = int((angle_end   - msg.angle_min) / msg.angle_increment)
+        idx_s = max(0, min(idx_s, len(msg.ranges) - 1))
+        idx_e = max(0, min(idx_e, len(msg.ranges) - 1))
+        if idx_s > idx_e:
+            idx_s, idx_e = idx_e, idx_s
+        vals = [msg.ranges[i] for i in range(idx_s, idx_e + 1)
+                if self._is_valid(msg.ranges[i], msg)]
+        return min(vals) if vals else float('inf')
 
-        return min(valid_ranges) if valid_ranges else float('inf')
-
-    def _valid_reading_ratio(self, msg: LaserScan) -> float:
-        """Return the fraction of LiDAR readings that are valid (not inf/nan)."""
-        valid = 0
-        for r in msg.ranges:
-            if not (math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max):
-                valid += 1
+    def _valid_reading_ratio(self, msg):
+        """Fraction of readings that are valid (not inf/nan)."""
+        valid = sum(1 for r in msg.ranges if self._is_valid(r, msg))
         return valid / len(msg.ranges) if msg.ranges else 0.0
 
-    def _get_avg_range_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> float:
-        """Get mean valid range in angular sector. Returns inf if no valid readings."""
-        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
-        idx_end   = int((angle_end   - msg.angle_min) / msg.angle_increment)
-        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
-        idx_end   = max(0, min(idx_end,   len(msg.ranges) - 1))
-        if idx_start > idx_end:
-            idx_start, idx_end = idx_end, idx_start
-        valid = [msg.ranges[i] for i in range(idx_start, idx_end + 1)
-                 if not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
-                         or msg.ranges[i] < msg.range_min or msg.ranges[i] > msg.range_max)]
-        return sum(valid) / len(valid) if valid else float('inf')
-
-    def _count_inf_sector(self, msg: LaserScan, angle_start: float, angle_end: float) -> int:
-        """Count inf/out-of-range readings in angular sector."""
-        idx_start = int((angle_start - msg.angle_min) / msg.angle_increment)
-        idx_end   = int((angle_end   - msg.angle_min) / msg.angle_increment)
-        idx_start = max(0, min(idx_start, len(msg.ranges) - 1))
-        idx_end   = max(0, min(idx_end,   len(msg.ranges) - 1))
-        if idx_start > idx_end:
-            idx_start, idx_end = idx_end, idx_start
-        return sum(
-            1 for i in range(idx_start, idx_end + 1)
-            if math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
-               or msg.ranges[i] > msg.range_max
-        )
-
-    def _estimate_circle_center(self, msg: LaserScan):
-        """Estimate circle center from valid lidar wall hits.
-
-        Returns (cx, cy) in robot base_link frame and the count of points used.
-        The centroid of points on a circular wall approximates the circle center.
-        """
-        sum_x = 0.0
-        sum_y = 0.0
-        count = 0
+    def _estimate_circle_center(self, msg):
+        """Centroid of valid wall hits in robot frame. Returns (cx, cy, count)."""
+        sx, sy, n = 0.0, 0.0, 0
         for i, r in enumerate(msg.ranges):
-            if math.isinf(r) or math.isnan(r) or r < msg.range_min or r > msg.range_max:
+            if not self._is_valid(r, msg):
                 continue
-            scan_angle = msg.angle_min + i * msg.angle_increment
-            # LiDAR is mounted rotated π from base_link
-            sum_x += -r * math.cos(scan_angle)
-            sum_y += -r * math.sin(scan_angle)
-            count += 1
-        if count == 0:
+            angle = msg.angle_min + i * msg.angle_increment
+            # LiDAR rotated pi: negate to get base_link frame
+            sx += -r * math.cos(angle)
+            sy += -r * math.sin(angle)
+            n += 1
+        if n == 0:
             return 0.0, 0.0, 0
-        return sum_x / count, sum_y / count, count
+        return sx / n, sy / n, n
 
-    # ── Center & Align (Feature 2) ──────────────────────────────────
-
-    def _center_and_align(self, msg: LaserScan) -> Twist:
-        """Handle CENTERING and ALIGNING phases. Returns the Twist command.
-
-        CENTERING: direction from old logic (move away from closest sector),
-                   speed from new logic (ramp down by dist_to_circle_center),
-                   EMA smoothing on output to suppress jitter.
-        ALIGNING:  rotate in place until front_left and front_right both read inf
-                   (exit gap is ahead). Error after 2 full rotations.
-        """
-        cmd = Twist()
-
-        if self.state == STATE_CENTERING:
-            # ── Measure 4 sectors (used for both exit check and direction) ──
-            front_dist = min(
-                self._get_min_range_sector(msg, math.radians(135), math.radians(179)),
-                self._get_min_range_sector(msg, math.radians(-179), math.radians(-135))
-            )
-            left_dist  = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
-            right_dist = self._get_min_range_sector(msg, math.radians(60),   math.radians(120))
-            back_dist  = self._get_min_range_sector(msg, math.radians(-30),  math.radians(30))
-
-            valid_dists = [v for v in [front_dist, left_dist, right_dist, back_dist]
-                           if not math.isinf(v)]
-
-            # ── Centered check: max spread between valid sectors ────
-            if valid_dists and (max(valid_dists) - min(valid_dists)) <= self.center_tolerance:
-                self.state = STATE_ALIGNING
-                self.align_cumulative_yaw = 0.0
-                self.align_prev_time = None
-                self.align_rotating = True
-                self.align_done_180 = False
-                self.prev_centering_cmd = Twist()
-                self.get_logger().info(
-                    f'CENTERED (spread={max(valid_dists) - min(valid_dists):.3f}m <= '
-                    f'{self.center_tolerance}m). Entering ALIGNING phase.')
-                return cmd
-
-            # ── Speed: centroid distance ramps down near center ─────
-            cx, cy, n_pts = self._estimate_circle_center(msg)
-            dist_to_center = math.hypot(cx, cy) if n_pts > 0 else float('inf')
-
-            slowdown_radius = 0.5
-            if dist_to_center < slowdown_radius:
-                speed = self.centering_lin_spd * (dist_to_center / slowdown_radius)
-                speed = max(speed, 0.03)
-            else:
-                speed = self.centering_lin_spd
-
-            # ── Direction: move away from closest sector ─────────────
-            directions = {'front': front_dist, 'left': left_dist,
-                          'right': right_dist, 'back': back_dist}
-            valid_dirs = {k: v for k, v in directions.items() if not math.isinf(v)}
-
-            if not valid_dirs:
-                self.get_logger().warn('CENTERING: all lidar directions read inf, stopping.')
-                return cmd
-
-            shortest_dir = min(valid_dirs, key=lambda k: valid_dirs[k])
-
-            raw = Twist()
-            if shortest_dir == 'front':
-                raw.linear.x = -speed
-            elif shortest_dir == 'back':
-                raw.linear.x = speed
-            elif shortest_dir == 'left':
-                raw.angular.z = -self.centering_ang_spd
-                raw.linear.x  = speed * 0.3
-            elif shortest_dir == 'right':
-                raw.angular.z = self.centering_ang_spd
-                raw.linear.x  = speed * 0.3
-
-            # ── EMA smoothing (α=0.35) to suppress jitter ─────────
-            alpha = 0.35
-            cmd.linear.x  = alpha * raw.linear.x  + (1 - alpha) * self.prev_centering_cmd.linear.x
-            cmd.angular.z = alpha * raw.angular.z + (1 - alpha) * self.prev_centering_cmd.angular.z
-            self.prev_centering_cmd = cmd
-
-            self.get_logger().info(
-                f'CENTERING: F={front_dist:.2f} L={left_dist:.2f} '
-                f'R={right_dist:.2f} B={back_dist:.2f} '
-                f'| closest={shortest_dir} center_dist={dist_to_center:.3f}m '
-                f'spd={cmd.linear.x:.3f} ang={cmd.angular.z:.3f}',
-                throttle_duration_sec=0.5)
-
-        elif self.state == STATE_ALIGNING:
-            if self.align_rotating:
-                now = self.get_clock().now()
-                if self.align_prev_time is not None:
-                    dt = max((now - self.align_prev_time).nanoseconds * 1e-9, 0.01)
-                    self.align_cumulative_yaw += abs(self.align_ang_spd) * dt
-                self.align_prev_time = now
-
-                # Failsafe: max 2 full rotations total
-                if self.align_cumulative_yaw >= 2 * 2 * math.pi:
-                    self.get_logger().error(
-                        f'ALIGNMENT FAILED: exceeded 2 rotations. Stopping.')
-                    self.state = STATE_DONE
-                    return cmd
-
-                if not self.align_done_180:
-                    # ── Sub-phase 1a: spin 180° unconditionally ──────
-                    if self.align_cumulative_yaw >= math.radians(120):
-                        self.align_done_180 = True
-                        self.get_logger().info(
-                            f'180° done. Starting balance check.')
-                    cmd.angular.z = self.align_ang_spd
-                    self.get_logger().info(
-                        f'ALIGNING spin: {math.degrees(self.align_cumulative_yaw):.0f}°/120°',
-                        throttle_duration_sec=0.5)
-                else:
-                    # ── Sub-phase 1b: rotate until L/R inf balanced ──
-                    # LiDAR rotated 180°: front-left = scan -90°..-180°,
-                    #                     front-right = scan +90°..+180°
-                    left_inf  = self._count_inf_sector(
-                        msg, math.radians(-180), math.radians(-90))
-                    right_inf = self._count_inf_sector(
-                        msg, math.radians(90),  math.radians(180))
-                    total_inf = left_inf + right_inf
-                    margin    = max(1, int(0.1 * total_inf))
-
-                    if total_inf >= 5 and abs(left_inf - right_inf) <= margin:
-                        self.align_rotating = False
-                        self.get_logger().info(
-                            f'Inf balanced: L={left_inf} R={right_inf} '
-                            f'(margin={margin}) after '
-                            f'{math.degrees(self.align_cumulative_yaw):.0f}°. Driving out.')
-                        return cmd
-
-                    # Rotate toward the side with more inf (gap is there)
-                    if right_inf > left_inf:
-                        cmd.angular.z = -self.align_ang_spd
-                    else:
-                        cmd.angular.z = self.align_ang_spd
-
-                    self.get_logger().info(
-                        f'ALIGNING balance: L={left_inf} R={right_inf} '
-                        f'diff={abs(left_inf - right_inf)} margin={margin} '
-                        f'yaw={math.degrees(self.align_cumulative_yaw):.0f}°',
-                        throttle_duration_sec=0.5)
-
-            else:
-                # ── Phase 2: drive forward until exited circle ───────
-                ratio = self._valid_reading_ratio(msg)
-                if ratio < self.inside_ratio:
-                    self.state = STATE_DONE
-                    self.get_logger().info(
-                        f'EXITED circle ({ratio:.0%} valid readings). DONE.')
-                    return cmd
-
-                cmd.linear.x = self.centering_lin_spd
-                self.get_logger().info(
-                    f'ALIGNING: driving out, valid={ratio:.0%}',
-                    throttle_duration_sec=0.5)
-
-        return cmd
-
-    # ── Main callback ───────────────────────────────────────────────
+    # ── Main callback ─────────────────────────────────────────────────
 
     def scan_callback(self, msg: LaserScan):
-        if self.state == STATE_DONE:
-            self.cmd_pub.publish(Twist())
-            return
-
-        # ── CENTERING / ALIGNING phases ─────────────────────────────
-        if self.state in (STATE_CENTERING, STATE_ALIGNING):
-            cmd = self._center_and_align(msg)
-            self.cmd_pub.publish(cmd)
-            return
-
-        # ── WALL_FOLLOWING phase ────────────────────────────────────
         now = self.get_clock().now()
         cmd = Twist()
 
-        # ── Check if inside the circle ──────────────────────────────
-        # When >60% of lidar readings see a wall, we're inside → centering.
-        # Guard: robot must have seen open space first (has_been_outside),
-        # so a corridor at startup never triggers CENTERING prematurely.
-        ratio = self._valid_reading_ratio(msg)
-        if ratio < self.inside_ratio:
-            self.has_been_outside = True
-            self.stop_confirm_count = 0
-        elif self.has_been_outside:
-            self.stop_confirm_count += 1
-            self.get_logger().info(
-                f'INSIDE CHECK {self.stop_confirm_count}/{self.stop_confirm_needed} '
-                f'valid={ratio:.0%}', throttle_duration_sec=0.5)
-            if self.stop_confirm_count >= self.stop_confirm_needed:
-                self.state = STATE_CENTERING
-                self.get_logger().info(
-                    f'ENTERED CIRCLE ({ratio:.0%} valid readings). '
-                    f'Starting CENTERING phase.')
-                self.cmd_pub.publish(Twist())
-                return
-
-        # ── Measure key sectors ─────────────────────────────────────
-        # NOTE: LiDAR is mounted rotated 180° (π) in the URDF.
-        #   Scan angle   0   = robot BACK
-        #   Scan angle  ±π   = robot FRONT
-        #   Scan angle  -π/2 = robot LEFT
-        #   Scan angle  +π/2 = robot RIGHT
-
-        # Left wall: -120° to -60° (centered on -90° = robot's left)
-        left_dist = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
-        # Slightly left-forward: -160° to -120° (anticipate curves)
-        left_fwd_dist = self._get_min_range_sector(msg, math.radians(-160), math.radians(-120))
-        # Front: two sectors near ±180° (robot forward)
-        front_left = self._get_min_range_sector(msg, math.radians(135), math.radians(179))
-        front_right = self._get_min_range_sector(msg, math.radians(-179), math.radians(-135))
+        # ── Measure key sectors ───────────────────────────────────────
+        # Left wall: -120 to -60 deg (centered on -90 = robot left)
+        left_dist = self._get_min_range_sector(
+            msg, math.radians(-120), math.radians(-60))
+        # Left-forward: -160 to -120 deg
+        left_fwd_dist = self._get_min_range_sector(
+            msg, math.radians(-160), math.radians(-120))
+        # Front: near +-180 deg (robot forward)
+        front_left  = self._get_min_range_sector(
+            msg, math.radians(135), math.radians(179))
+        front_right = self._get_min_range_sector(
+            msg, math.radians(-179), math.radians(-135))
         front_dist = min(front_left, front_right)
 
-        # Best estimate of left wall distance
         wall_dist = min(left_dist, left_fwd_dist * 1.1)
+        valid_ratio = self._valid_reading_ratio(msg)
 
-        # ── State machine ───────────────────────────────────────────
+        # ── Priority 1: Front obstacle → turn right ──────────────────
         if front_dist < self.front_obs_dist:
-            # FRONT OBSTACLE: stop and turn right sharply
             cmd.linear.x = 0.0
             cmd.angular.z = -1.0
             self.prev_error = 0.0
-            # Reset spiral state so the next search starts fresh
-            self._spiral_lin_speed = 0.0
-            self._spiral_yaw_accum = 0.0
-            self._spiral_arm_count = 0
-            self._spiral_prev_time = None
             self.get_logger().info(
-                f'FRONT OBSTACLE {front_dist:.2f}m — turning right', throttle_duration_sec=0.5)
+                f'OBSTACLE front={front_dist:.2f}m — turning right',
+                throttle_duration_sec=0.5)
 
-        elif wall_dist > self.max_search_dist:
-            # NO WALL FOUND: expanding spiral search.
-            # Each half-revolution the linear (outward) speed increases,
-            # widening the spiral until any reading becomes finite.
+        # ── Priority 2: Inside circle → centering or stop ────────────
+        elif valid_ratio > self.inside_ratio:
+            # Measure 4 quadrant sectors
+            q_front = min(
+                self._get_min_range_sector(msg, math.radians(135), math.radians(179)),
+                self._get_min_range_sector(msg, math.radians(-179), math.radians(-135)))
+            q_left  = self._get_min_range_sector(msg, math.radians(-120), math.radians(-60))
+            q_right = self._get_min_range_sector(msg, math.radians(60),   math.radians(120))
+            q_back  = self._get_min_range_sector(msg, math.radians(-30),  math.radians(30))
+
+            valid_dists = [v for v in [q_front, q_left, q_right, q_back]
+                           if not math.isinf(v)]
+
+            # Centered check: spread between quadrants
+            if valid_dists and (max(valid_dists) - min(valid_dists)) <= self.center_tolerance:
+                # Check if front is open (exit)
+                front_inf = math.isinf(front_left) or math.isinf(front_right)
+                if front_inf:
+                    cmd.linear.x = 0.0
+                    cmd.angular.z = 0.0
+                    self.get_logger().info(
+                        f'STOPPED at center (spread={max(valid_dists)-min(valid_dists):.3f}m, exit ahead)',
+                        throttle_duration_sec=0.5)
+                else:
+                    cmd.angular.z = 0.4
+                    self.get_logger().info(
+                        f'CENTERED (spread={max(valid_dists)-min(valid_dists):.3f}m) — rotating to find exit',
+                        throttle_duration_sec=0.5)
+            else:
+                # Move away from closest quadrant, speed from centroid distance
+                cx, cy, n_pts = self._estimate_circle_center(msg)
+                dist_to_center = math.hypot(cx, cy) if n_pts > 0 else float('inf')
+
+                slowdown_radius = 0.5
+                if dist_to_center < slowdown_radius:
+                    speed = self.centering_speed * (dist_to_center / slowdown_radius)
+                    speed = max(speed, 0.03)
+                else:
+                    speed = self.centering_speed
+
+                directions = {'front': q_front, 'left': q_left,
+                              'right': q_right, 'back': q_back}
+                valid_dirs = {k: v for k, v in directions.items() if not math.isinf(v)}
+
+                if valid_dirs:
+                    shortest = min(valid_dirs, key=lambda k: valid_dirs[k])
+                    if shortest == 'front':
+                        cmd.linear.x = -speed
+                    elif shortest == 'back':
+                        cmd.linear.x = speed
+                    elif shortest == 'left':
+                        cmd.angular.z = -self.centering_speed
+                        cmd.linear.x = speed * 0.3
+                    elif shortest == 'right':
+                        cmd.angular.z = self.centering_speed
+                        cmd.linear.x = speed * 0.3
+
+                self.get_logger().info(
+                    f'CENTERING F={q_front:.2f} L={q_left:.2f} '
+                    f'R={q_right:.2f} B={q_back:.2f} '
+                    f'center_d={dist_to_center:.3f}m spd={speed:.3f}',
+                    throttle_duration_sec=0.5)
+
             self.prev_error = 0.0
 
-            # --- integrate yaw for the current arm ---
-            spiral_now = self.get_clock().now()
-            if self._spiral_prev_time is not None:
-                spiral_dt = max(
-                    (spiral_now - self._spiral_prev_time).nanoseconds * 1e-9, 0.001)
-                self._spiral_yaw_accum += abs(self._spiral_ang_speed) * spiral_dt
-            self._spiral_prev_time = spiral_now
-
-            # After π radians (half revolution) → complete one arm, increase speed
-            if self._spiral_yaw_accum >= math.pi:
-                self._spiral_yaw_accum -= math.pi   # keep remainder
-                self._spiral_arm_count += 1
-                self._spiral_lin_speed = min(
-                    self._spiral_lin_max,
-                    self._spiral_lin_step * self._spiral_arm_count
-                )
-                self.get_logger().info(
-                    f'SPIRAL arm {self._spiral_arm_count}: '
-                    f'lin_speed={self._spiral_lin_speed:.3f} m/s')
-
-            cmd.linear.x  = self._spiral_lin_speed
-            cmd.angular.z = self._spiral_ang_speed
+        # ── Priority 3: No wall → fixed search velocity ──────────────
+        elif wall_dist > self.max_search_dist:
+            cmd.linear.x = self.search_lin_spd
+            cmd.angular.z = self.search_ang_spd
+            self.prev_error = 0.0
             self.get_logger().info(
-                f'SPIRAL SEARCH arm={self._spiral_arm_count} '
-                f'yaw={math.degrees(self._spiral_yaw_accum):.0f}° '
-                f'lin={self._spiral_lin_speed:.3f} left={left_dist:.2f}m',
+                f'SEARCH (no wall) lin={self.search_lin_spd:.2f} '
+                f'ang={self.search_ang_spd:.2f}',
                 throttle_duration_sec=1.0)
 
+        # ── Priority 4: PD wall following ─────────────────────────────
         else:
-            # Wall found — reset spiral state for the next time we lose it
-            self._spiral_lin_speed = 0.0
-            self._spiral_yaw_accum = 0.0
-            self._spiral_arm_count = 0
-            self._spiral_prev_time = None
-            # WALL FOLLOWING with PD control
-            # error > 0 means too far from wall → turn left (positive angular.z)
-            # error < 0 means too close → turn right (negative angular.z)
             error = wall_dist - self.desired_dist
 
             dt = 0.1
@@ -468,86 +237,27 @@ class WallFollowerNode(Node):
 
             self.prev_error = error
 
+            # PD controller: omega = Kp * e + Kd * de/dt
             angular_z = self.kp * error + self.kd * d_error
-            angular_z = max(-1.0, min(1.0, angular_z))  # clamp
+            angular_z = max(-1.0, min(1.0, angular_z))
 
-            # ── Speed: proportional cap from left-sector validity ──────
-            # Count how many rays in the left window are finite.
-            left_idx_start = int((math.radians(-120) - msg.angle_min) / msg.angle_increment)
-            left_idx_end   = int((math.radians(-60)  - msg.angle_min) / msg.angle_increment)
-            left_idx_start = max(0, min(left_idx_start, len(msg.ranges) - 1))
-            left_idx_end   = max(0, min(left_idx_end,   len(msg.ranges) - 1))
-            if left_idx_start > left_idx_end:
-                left_idx_start, left_idx_end = left_idx_end, left_idx_start
-            left_total = left_idx_end - left_idx_start + 1
-            left_valid = sum(
-                1 for i in range(left_idx_start, left_idx_end + 1)
-                if not (math.isinf(msg.ranges[i]) or math.isnan(msg.ranges[i])
-                        or msg.ranges[i] < msg.range_min or msg.ranges[i] > msg.range_max)
-            )
-            # valid_ratio in [0, 1]; scales the max speed ceiling proportionally.
-            left_valid_ratio = left_valid / left_total if left_total > 0 else 1.0
-            
-            # Reductions are same factor but weighted by 0.5 for infs (missing readings).
-            # E.g. if 90% valid -> 10% missing * 0.5 = 5% speed reduction.
-            reduction_factor = (1.0 - left_valid_ratio) * 1.5
-            speed_multiplier = max(0.0, 1.0 - reduction_factor)
-            
-            # Reduce speed by an inverse factor of the angular speed
-            speed_multiplier *= max(0.0, 1.0 - abs(angular_z))
-            
-            speed_ceiling = self.forward_speed * speed_multiplier
-            # Never go below base_speed as ceiling (avoid stalling on a momentary blip).
-            speed_ceiling = max(speed_ceiling, self.base_speed)
+            # Speed: v = v_base - Kv * |e|  (from T02c slide 55)
+            speed = self.forward_speed - self.kv * abs(error)
+            speed = max(self.base_speed, speed)
 
-            left_has_inf = left_valid < left_total   # kept for logging
-            left_avg = self._get_avg_range_sector(
-                msg, math.radians(-120), math.radians(-60))
-            left_curving = (self.prev_left_avg is not None and
-                            not math.isinf(left_avg) and
-                            left_avg - self.prev_left_avg > 0.03)
-            self.prev_left_avg = left_avg
-
-            # Accelerate up to the proportional ceiling; slow-down on curves/steering/distance error.
-            # Only accelerate if the distance to the wall is >= 0.95m
-            can_accel = (not left_curving and 
-                         abs(angular_z) < self.accel_ang_thresh and 
-                         wall_dist >= 0.95)
-
-            dt_spd = dt  # reuse dt already computed above
-            if can_accel:
-                self.current_speed = min(
-                    speed_ceiling,
-                    self.current_speed + self.accel * dt_spd)
-            else:
-                # Ramp down toward base_speed (not a hard jump).
-                self.current_speed = max(
-                    self.base_speed,
-                    self.current_speed - self.accel * dt_spd)
-            # Also clamp in case ceiling just dropped below current speed.
-            self.current_speed = min(self.current_speed, speed_ceiling)
-
-            speed = self.current_speed
-            
-            # Early brake for circle approach: >50% valid lidars and front wall visible
-            ratio_overall = self._valid_reading_ratio(msg)
-            if ratio_overall > 0.5 and not math.isinf(front_dist):
-                speed = min(speed, 0.15)
-                self.current_speed = min(self.current_speed, 0.15)
-                
-            if front_dist < self.front_slow_dist:
-                front_scale = max(0.1, (front_dist - self.front_obs_dist) /
-                                  (self.front_slow_dist - self.front_obs_dist))
+            # Slow down near front obstacles
+            if front_dist < 1.5:
+                front_scale = max(0.1,
+                    (front_dist - self.front_obs_dist) /
+                    (1.5 - self.front_obs_dist))
                 speed *= front_scale
                 angular_z = min(angular_z, -0.3)
+
             cmd.linear.x = speed
             cmd.angular.z = angular_z
-
             self.get_logger().info(
-                f'FOLLOWING left={wall_dist:.2f}m err={error:+.2f} '
-                f'ang={angular_z:+.2f} spd={cmd.linear.x:.2f} '
-                f'left_valid={left_valid_ratio:.0%} ceil={speed_ceiling:.2f} '
-                f'{"[CRV]" if left_curving else "[ACC]"}',
+                f'FOLLOW left={wall_dist:.2f}m err={error:+.2f} '
+                f'ang={angular_z:+.2f} spd={speed:.2f}',
                 throttle_duration_sec=1.0)
 
         self.prev_time = now
@@ -555,16 +265,15 @@ class WallFollowerNode(Node):
 
 
 def main(args=None):
-
     rclpy.init(args=args)
     node = WallFollowerNode()
-    
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
-    
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        cmd = Twist()
-        node.cmd_pub.publish(cmd)
+        node.cmd_pub.publish(Twist())
         node.destroy_node()
         rclpy.shutdown()
 

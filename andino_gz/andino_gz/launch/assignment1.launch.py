@@ -30,7 +30,7 @@ ROBOT_Z = 0.05        # ground level (just above floor)
 SAMPLE_X_MIN, SAMPLE_X_MAX = -4.0, 8.0
 SAMPLE_Y_MIN, SAMPLE_Y_MAX = -3.0, 7.0
 
-FIXED_SPAWN = 1
+FIXED_SPAWN = 0
 
 def _box_distance(px, py, cx, cy, sx, sy):
     """Signed distance from point (px,py) to axis-aligned box centered at (cx,cy) with size (sx,sy).
@@ -87,12 +87,14 @@ def random_spawn():
         x = random.uniform(SAMPLE_X_MIN, SAMPLE_X_MAX)
         y = random.uniform(SAMPLE_Y_MIN, SAMPLE_Y_MAX)
 
-        d_min = min_wall_distance(x, y)
-        # Must be outside all walls with clearance
-        if d_min < MIN_WALL_DIST:
+        # Must be outside EACH wall with clearance (reject if inside ANY)
+        d_vert = _box_distance(x, y, *L_VERT_CENTER, *L_VERT_SIZE)
+        d_horiz = _box_distance(x, y, *L_HORIZ_CENTER, *L_HORIZ_SIZE)
+        d_ring = _circle_ring_distance(x, y)
+        if d_vert < MIN_WALL_DIST or d_horiz < MIN_WALL_DIST or d_ring < MIN_WALL_DIST:
             continue
         # Must be close enough to at least sense walls
-        d_closest = closest_wall_distance(x, y)
+        d_closest = min(abs(d_vert), abs(d_horiz), abs(d_ring))
         if d_closest > MAX_WALL_DIST:
             continue
         # Valid!
