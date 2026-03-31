@@ -12,8 +12,8 @@ Simulação Gazebo com um robot diferencial (Andino) que segue paredes usando Li
 
 ```bash
 cd ~/tri_ws
-source install/setup.bash
 colcon build
+source install/setup.bash
 ```
 
 ## Correr a simulação
@@ -22,6 +22,7 @@ colcon build
 
 ```bash
 source ~/tri_ws/install/setup.bash
+source ~/ros2_ws/install/setup.bash
 ros2 launch andino_gz assignment1.launch.py
 ```
 
@@ -31,6 +32,7 @@ ros2 launch andino_gz assignment1.launch.py
 
 ```bash
 source ~/tri_ws/install/setup.bash
+source ~/ros2_ws/install/setup.bash
 ros2 launch wall_follower wall_follower.launch.py
 ```
 

@@ -30,7 +30,7 @@ ROBOT_Z = 0.05        # ground level (just above floor)
 SAMPLE_X_MIN, SAMPLE_X_MAX = -4.0, 8.0
 SAMPLE_Y_MIN, SAMPLE_Y_MAX = -3.0, 7.0
 
-FIXED_SPAWN = 0
+FIXED_SPAWN = 0  # Set to 1 to use fixed spawn, 0 for random spawn
 
 def _box_distance(px, py, cx, cy, sx, sy):
     """Signed distance from point (px,py) to axis-aligned box centered at (cx,cy) with size (sx,sy).
@@ -79,7 +79,6 @@ def fixed_spawn():
     facing right (yaw=0) so left-wall-following picks up the path.
     """
     return -2.5, 5.0, 0.0
-
 
 def random_spawn():
     """Find a random valid spawn position via rejection sampling."""

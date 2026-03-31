@@ -216,6 +216,7 @@ class WallFollowerNode(Node):
 
             self.prev_error = 0.0
 
+    
         # ── Priority 3: No wall → fixed search velocity ──────────────
         elif wall_dist > self.max_search_dist:
             cmd.linear.x = self.search_lin_spd
@@ -226,6 +227,7 @@ class WallFollowerNode(Node):
                 f'ang={self.search_ang_spd:.2f}',
                 throttle_duration_sec=1.0)
 
+        
         # ── Priority 4: PD wall following ─────────────────────────────
         else:
             error = wall_dist - self.desired_dist

@@ -110,6 +110,7 @@ The driving and wall-following logic also lives here. As of march 19th:
 
 1. Create optional fixed start position (useful for development)
 2. Create stop-center-turn-leave condition (requested in guidelines) 
+3. Change [[The Robot]](#the-robot) section, João fixed and now the robot is 100% reactive (30/03/2026) - maybe i'll leave it to Rafa since he likes to write in these type of files
 
 ## Issues
 
