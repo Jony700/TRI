@@ -92,10 +92,17 @@ def random_spawn():
         d_ring = _circle_ring_distance(x, y)
         if d_vert < MIN_WALL_DIST or d_horiz < MIN_WALL_DIST or d_ring < MIN_WALL_DIST:
             continue
+        
+        # Must spawn completely OUTSIDE the circle area
+        dist_to_circle_center = math.sqrt((x - CIRCLE_CENTER[0])**2 + (y - CIRCLE_CENTER[1])**2)
+        if dist_to_circle_center < (CIRCLE_R_OUTER + MIN_WALL_DIST):
+            continue
+
         # Must be close enough to at least sense walls
         d_closest = min(abs(d_vert), abs(d_horiz), abs(d_ring))
         if d_closest > MAX_WALL_DIST:
             continue
+        
         # Valid!
         yaw = random.uniform(-math.pi, math.pi)
         return x, y, yaw

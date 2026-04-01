@@ -133,10 +133,11 @@ class WallFollowerNode(Node):
         left_fwd_dist = self._get_min_range_sector(
             msg, math.radians(-160), math.radians(-120))
         # Front: near +-180 deg (robot forward)
+        # Narrowed the field of view from 135 to 160 to avoid false positives at the entrance
         front_left  = self._get_min_range_sector(
-            msg, math.radians(135), math.radians(179))
+            msg, math.radians(160), math.radians(179))
         front_right = self._get_min_range_sector(
-            msg, math.radians(-179), math.radians(-135))
+            msg, math.radians(-179), math.radians(-160))
         front_dist = min(front_left, front_right)
 
         wall_dist = min(left_dist, left_fwd_dist * 1.1)
@@ -216,7 +217,6 @@ class WallFollowerNode(Node):
 
             self.prev_error = 0.0
 
-    
         # ── Priority 3: No wall → fixed search velocity ──────────────
         elif wall_dist > self.max_search_dist:
             cmd.linear.x = self.search_lin_spd
@@ -227,7 +227,6 @@ class WallFollowerNode(Node):
                 f'ang={self.search_ang_spd:.2f}',
                 throttle_duration_sec=1.0)
 
-        
         # ── Priority 4: PD wall following ─────────────────────────────
         else:
             error = wall_dist - self.desired_dist
