@@ -44,7 +44,7 @@ class WallFollowerNode(Node):
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('inside_ratio_threshold', 0.6)
-        self.declare_parameter('center_tolerance', 0.1)
+        self.declare_parameter('center_tolerance', 0.5)
         self.declare_parameter('centering_speed', 0.15)
         self.declare_parameter('search_linear_speed', 0.3)
         self.declare_parameter('search_angular_speed', 0.5)
@@ -104,6 +104,18 @@ class WallFollowerNode(Node):
         valid = sum(1 for r in msg.ranges if self._is_valid(r, msg))
         return valid / len(msg.ranges) if msg.ranges else 0.0
 
+    def _count_inf_sector(self, msg, angle_start, angle_end):
+        """Count inf/out-of-range readings in angular sector [angle_start, angle_end]."""
+        idx_s = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_e = int((angle_end   - msg.angle_min) / msg.angle_increment)
+        idx_s = max(0, min(idx_s, len(msg.ranges) - 1))
+        idx_e = max(0, min(idx_e, len(msg.ranges) - 1))
+        if idx_s > idx_e:
+            idx_s, idx_e = idx_e, idx_s
+        return sum(
+            1 for i in range(idx_s, idx_e + 1)
+            if not self._is_valid(msg.ranges[i], msg))
+
     def _estimate_circle_center(self, msg):
         """Centroid of valid wall hits in robot frame. Returns (cx, cy, count)."""
         sx, sy, n = 0.0, 0.0, 0
@@ -152,7 +164,7 @@ class WallFollowerNode(Node):
                 f'OBSTACLE front={front_dist:.2f}m — turning right',
                 throttle_duration_sec=0.5)
 
-        # ── Priority 2: Inside circle → centering or stop ────────────
+        # ── Priority 2: Inside circle → centering & align to gap ──────
         elif valid_ratio > self.inside_ratio:
             # Measure 4 quadrant sectors
             q_front = min(
@@ -162,42 +174,63 @@ class WallFollowerNode(Node):
             q_right = self._get_min_range_sector(msg, math.radians(60),   math.radians(120))
             q_back  = self._get_min_range_sector(msg, math.radians(-30),  math.radians(30))
 
-            valid_dists = [v for v in [q_front, q_left, q_right, q_back]
-                           if not math.isinf(v)]
+            # Dist to circle center is rotation-invariant
+            cx, cy, n_pts = self._estimate_circle_center(msg)
+            dist_to_center = math.hypot(cx, cy) if n_pts > 0 else float('inf')
 
-            # Centered check: spread between quadrants
-            if valid_dists and (max(valid_dists) - min(valid_dists)) <= self.center_tolerance:
-                # Check if front is open (exit)
-                front_inf = math.isinf(front_left) or math.isinf(front_right)
-                if front_inf:
-                    cmd.linear.x = 0.0
+            # Count infs to see if gap is directly ahead
+            left_inf  = self._count_inf_sector(msg, math.radians(-180), math.radians(-90))
+            right_inf = self._count_inf_sector(msg, math.radians(90),   math.radians(180))
+            total_inf = left_inf + right_inf
+            margin    = max(2, int(0.3 * total_inf))  # less strict margin (30%)
+            min_gap_infs = 3
+
+            # Rotate until the immediate front sector is infinite, then check loose balance
+            is_front_inf = math.isinf(front_dist)
+            is_aligned_with_gap = is_front_inf and (total_inf >= min_gap_infs) and (abs(left_inf - right_inf) <= margin)
+
+            # If cx < -0.15, the circle's centroid is behind the robot in its own frame.
+            # Geometrically, if we are inside the circle but facing away from its center,
+            # we MUST be facing an outward boundary (acting as a reactive "Exiting" lock!)
+            is_facing_away_from_center = (cx < -0.15)
+            
+            # As the robot spins in place, polygonal noise causes dist_to_center to 
+            # artificially fluctuate (e.g. from 0.50m to 0.53m). To prevent oscillating 
+            # out of the align phase without using memory, we check if it is actively 
+            # spinning around the center (cx has started dropping below the tolerance).
+            is_spinning_at_center = (dist_to_center <= self.center_tolerance + 0.2) and (cx <= self.center_tolerance)
+
+            # We trigger the align/exit phase if we are near the center of the room,
+            # OR if we are actively exiting (facing away from the center).
+            if dist_to_center <= self.center_tolerance or is_spinning_at_center or is_facing_away_from_center:
+                if is_aligned_with_gap:
+                    # DRIVE OUT
+                    cmd.linear.x = self.centering_speed
                     cmd.angular.z = 0.0
-                    self.get_logger().info(
-                        f'STOPPED at center (spread={max(valid_dists)-min(valid_dists):.3f}m, exit ahead)',
-                        throttle_duration_sec=0.5)
+                    self.get_logger().info('EXITING GAP', throttle_duration_sec=0.5)
                 else:
-                    cmd.angular.z = 0.4
-                    self.get_logger().info(
-                        f'CENTERED (spread={max(valid_dists)-min(valid_dists):.3f}m) — rotating to find exit',
-                        throttle_duration_sec=0.5)
+                    # ALIGN (rotate towards gap)
+                    cmd.linear.x = 0.0  # Explicitly hold linear velocity at 0 until aligned
+                    if right_inf > left_inf:
+                        cmd.angular.z = -0.4
+                    else:
+                        cmd.angular.z = 0.4
+                    self.get_logger().info('ALIGNING TO GAP', throttle_duration_sec=0.5)
             else:
-                # Move away from closest quadrant, speed from centroid distance
-                cx, cy, n_pts = self._estimate_circle_center(msg)
-                dist_to_center = math.hypot(cx, cy) if n_pts > 0 else float('inf')
-
-                slowdown_radius = 0.5
-                if dist_to_center < slowdown_radius:
-                    speed = self.centering_speed * (dist_to_center / slowdown_radius)
-                    speed = max(speed, 0.03)
-                else:
-                    speed = self.centering_speed
-
-                directions = {'front': q_front, 'left': q_left,
-                              'right': q_right, 'back': q_back}
+                # CENTERING (we are not centered, move away from closest wall)
+                directions = {'front': q_front, 'left': q_left, 'right': q_right, 'back': q_back}
                 valid_dirs = {k: v for k, v in directions.items() if not math.isinf(v)}
-
+                
                 if valid_dirs:
                     shortest = min(valid_dirs, key=lambda k: valid_dirs[k])
+                    
+                    slowdown_radius = 0.5
+                    if dist_to_center < slowdown_radius:
+                        speed = self.centering_speed * (dist_to_center / slowdown_radius)
+                        speed = max(speed, 0.03)
+                    else:
+                        speed = self.centering_speed
+
                     if shortest == 'front':
                         cmd.linear.x = -speed
                     elif shortest == 'back':
@@ -208,12 +241,8 @@ class WallFollowerNode(Node):
                     elif shortest == 'right':
                         cmd.angular.z = self.centering_speed
                         cmd.linear.x = speed * 0.3
-
-                self.get_logger().info(
-                    f'CENTERING F={q_front:.2f} L={q_left:.2f} '
-                    f'R={q_right:.2f} B={q_back:.2f} '
-                    f'center_d={dist_to_center:.3f}m spd={speed:.3f}',
-                    throttle_duration_sec=0.5)
+                        
+                self.get_logger().info(f'CENTERING (dist={dist_to_center:.2f}m)', throttle_duration_sec=0.5)
 
             self.prev_error = 0.0
 
