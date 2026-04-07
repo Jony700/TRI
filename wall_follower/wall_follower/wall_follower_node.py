@@ -36,11 +36,17 @@ class WallFollowerNode(Node):
         self.declare_parameter('desired_distance', 1.0)
         self.declare_parameter('base_speed', 0.5)
         self.declare_parameter('forward_speed', 1.0)
-        self.declare_parameter('kp', 1.2)
-        self.declare_parameter('kd', 0.4)
+        self.declare_parameter('kp', 0.8)
+        self.declare_parameter('ki', 0.02)
+        self.declare_parameter('kd', 0.8)
+        self.declare_parameter('kd_filter', 0.2)   # derivative low-pass alpha (0=frozen, 1=raw)
         self.declare_parameter('kv', 0.3)
+        self.declare_parameter('max_linear_vel', 1.0)
+        self.declare_parameter('max_angular_vel', 1.5)
+        self.declare_parameter('max_accel', 0.8)
+        self.declare_parameter('wheel_separation', 0.137)
+        self.declare_parameter('max_wheel_vel', 0.8)
         self.declare_parameter('front_obstacle_dist', 0.8)
-        self.declare_parameter('max_wall_search_dist', 3.0)
         self.declare_parameter('scan_topic', 'scan')
         self.declare_parameter('cmd_vel_topic', 'cmd_vel')
         self.declare_parameter('inside_ratio_threshold', 0.6)
@@ -54,10 +60,16 @@ class WallFollowerNode(Node):
         self.base_speed       = self.get_parameter('base_speed').value
         self.forward_speed    = self.get_parameter('forward_speed').value
         self.kp               = self.get_parameter('kp').value
+        self.ki               = self.get_parameter('ki').value
         self.kd               = self.get_parameter('kd').value
+        self.kd_filter        = self.get_parameter('kd_filter').value
         self.kv               = self.get_parameter('kv').value
+        self.max_linear_vel   = self.get_parameter('max_linear_vel').value
+        self.max_angular_vel  = self.get_parameter('max_angular_vel').value
+        self.max_accel        = self.get_parameter('max_accel').value
+        self.wheel_sep        = self.get_parameter('wheel_separation').value
+        self.max_wheel_vel    = self.get_parameter('max_wheel_vel').value
         self.front_obs_dist   = self.get_parameter('front_obstacle_dist').value
-        self.max_search_dist  = self.get_parameter('max_wall_search_dist').value
         self.inside_ratio     = self.get_parameter('inside_ratio_threshold').value
         self.center_tolerance = self.get_parameter('center_tolerance').value
         self.centering_speed  = self.get_parameter('centering_speed').value
@@ -67,9 +79,12 @@ class WallFollowerNode(Node):
         scan_topic = self.get_parameter('scan_topic').value
         cmd_topic  = self.get_parameter('cmd_vel_topic').value
 
-        # ── Only PD memory (allowed by reactive architecture) ─────────
-        self.prev_error = 0.0
-        self.prev_time  = None
+        # ── Only PID memory (allowed by reactive architecture) ────────
+        self.prev_error      = 0.0
+        self.integral_error  = 0.0
+        self.filtered_d_err  = 0.0   # low-pass filtered derivative
+        self.prev_linear_vel = 0.0
+        self.prev_time       = None
 
         # ── Publishers & Subscribers ──────────────────────────────────
         self.cmd_pub  = self.create_publisher(Twist, cmd_topic, 10)
@@ -78,7 +93,9 @@ class WallFollowerNode(Node):
 
         self.get_logger().info(
             f'Wall follower (reactive) started: desired_dist={self.desired_dist}m, '
-            f'speed={self.forward_speed}m/s, kp={self.kp}, kd={self.kd}')
+            f'speed={self.forward_speed}m/s, kp={self.kp}, ki={self.ki}, kd={self.kd}, '
+            f'max_vel={self.max_linear_vel}m/s, max_omega={self.max_angular_vel}rad/s, '
+            f'max_accel={self.max_accel}m/s², max_wheel_vel={self.max_wheel_vel}m/s')
 
     # ── Helpers (all per-scan, no state) ──────────────────────────────
 
@@ -116,6 +133,19 @@ class WallFollowerNode(Node):
             1 for i in range(idx_s, idx_e + 1)
             if not self._is_valid(msg.ranges[i], msg))
 
+    def _inf_ratio_sector(self, msg, angle_start, angle_end):
+        """Fraction of inf/out-of-range readings in angular sector (0.0 = all valid, 1.0 = all inf)."""
+        idx_s = int((angle_start - msg.angle_min) / msg.angle_increment)
+        idx_e = int((angle_end   - msg.angle_min) / msg.angle_increment)
+        idx_s = max(0, min(idx_s, len(msg.ranges) - 1))
+        idx_e = max(0, min(idx_e, len(msg.ranges) - 1))
+        if idx_s > idx_e:
+            idx_s, idx_e = idx_e, idx_s
+        total = idx_e - idx_s + 1
+        infs  = sum(1 for i in range(idx_s, idx_e + 1)
+                    if not self._is_valid(msg.ranges[i], msg))
+        return infs / total if total > 0 else 0.0
+
     def _estimate_circle_center(self, msg):
         """Centroid of valid wall hits in robot frame. Returns (cx, cy, count)."""
         sx, sy, n = 0.0, 0.0, 0
@@ -138,12 +168,12 @@ class WallFollowerNode(Node):
         cmd = Twist()
 
         # ── Measure key sectors ───────────────────────────────────────
-        # Left wall: -120 to -60 deg (centered on -90 = robot left)
+        # Left wall: wider ±50° sector around -90° to keep wall in view through corners
         left_dist = self._get_min_range_sector(
-            msg, math.radians(-120), math.radians(-60))
-        # Left-forward: -160 to -120 deg
+            msg, math.radians(-140), math.radians(-40))
+        # Left-forward lookahead: tight sector just ahead of the main left zone
         left_fwd_dist = self._get_min_range_sector(
-            msg, math.radians(-160), math.radians(-120))
+            msg, math.radians(-170), math.radians(-140))
         # Front: near +-180 deg (robot forward)
         # Narrowed the field of view from 135 to 160 to avoid false positives at the entrance
         front_left  = self._get_min_range_sector(
@@ -152,7 +182,7 @@ class WallFollowerNode(Node):
             msg, math.radians(-179), math.radians(-160))
         front_dist = min(front_left, front_right)
 
-        wall_dist = min(left_dist, left_fwd_dist * 1.1)
+        wall_dist = min(left_dist, left_fwd_dist * 1.05)
         valid_ratio = self._valid_reading_ratio(msg)
 
         # Dist to circle center is rotation-invariant (used globally for centering and exit-locking)
@@ -164,7 +194,9 @@ class WallFollowerNode(Node):
         if front_dist < self.front_obs_dist:
             cmd.linear.x = 0.0
             cmd.angular.z = -1.0
-            self.prev_error = 0.0
+            self.prev_error     = 0.0
+            self.integral_error = 0.0
+            self.filtered_d_err = 0.0
             self.get_logger().info(
                 f'OBSTACLE front={front_dist:.2f}m — turning right',
                 throttle_duration_sec=0.5)
@@ -236,10 +268,12 @@ class WallFollowerNode(Node):
                         
                 self.get_logger().info(f'CENTERING (dist={dist_to_center:.2f}m)', throttle_duration_sec=0.5)
 
-            self.prev_error = 0.0
+            self.prev_error     = 0.0
+            self.integral_error = 0.0
+            self.filtered_d_err = 0.0
 
         # ── Priority 3: No wall on left → Wall Seeking vs Search ─────────
-        elif wall_dist > self.max_search_dist:
+        elif wall_dist > 2.0 * self.desired_dist:
             # We are not close enough to follow a wall on the left.
             # Check if we see a wall *anywhere* else globally.
             min_dist = float('inf')
@@ -254,18 +288,30 @@ class WallFollowerNode(Node):
                 # We see a wall somewhere!
                 # LiDAR is physically rotated by pi. Convert angle so 0 is robot FRONT.
                 angle_to_front = math.atan2(math.sin(min_angle - math.pi), math.cos(min_angle - math.pi))
-                self.prev_error = 0.0
-                
-                # Rotate until facing the wall (within roughly 11 degrees)
-                if abs(angle_to_front) > 0.2:
-                    cmd.linear.x = 0.0
-                    cmd.angular.z = 0.5 if angle_to_front > 0 else -0.5
-                    self.get_logger().info('ROTATING TO FACE WALL', throttle_duration_sec=0.5)
-                else:
-                    # Once facing it, drive straight to it to get close enough
-                    cmd.linear.x = self.forward_speed
-                    cmd.angular.z = 0.0
-                    self.get_logger().info('DRIVING TOWARDS WALL', throttle_duration_sec=0.5)
+                self.prev_error     = 0.0
+                self.integral_error = 0.0
+
+                # Proportional steering towards wall.
+                # cos(angle) = 1.0 when facing wall, 0 at 90°, negative when facing away.
+                # When wall is behind (|angle| > 90°): stop and rotate in place.
+                # When wall is ahead: drive forward with proportional correction.
+                seek_ang = max(-self.max_angular_vel,
+                               min(self.max_angular_vel, 1.5 * angle_to_front))
+                alignment = math.cos(angle_to_front)
+                cmd.linear.x  = self.forward_speed * max(0.0, alignment)
+
+                # Brake smoothly as we approach the wall so PID handoff isn't a crash.
+                # Ramps from full speed at 4× desired_dist down to ~15% at desired_dist.
+                handoff = 2.0 * self.desired_dist
+                if min_dist < 2.0 * handoff:
+                    approach_scale = max(0.15, (min_dist - self.desired_dist) / handoff)
+                    cmd.linear.x *= approach_scale
+
+                cmd.angular.z = seek_ang
+                self.get_logger().info(
+                    f'SEEKING WALL err={math.degrees(angle_to_front):.1f}° '
+                    f'lin={cmd.linear.x:.2f} ang={seek_ang:.2f}',
+                    throttle_duration_sec=0.5)
             else:
                 # ── Priority 3.5: No wall ANYWHERE → expanding spiral search 
                 # To remain strictly memoryless by the assignment's rule (no states), 
@@ -283,24 +329,52 @@ class WallFollowerNode(Node):
                     f'ang={self.search_ang_spd:.2f}',
                     throttle_duration_sec=1.0)
 
-        # ── Priority 4: PD wall following ─────────────────────────────
+        # ── Priority 4: PID wall following ────────────────────────────
         else:
             error = wall_dist - self.desired_dist
 
             dt = 0.1
             if self.prev_time is not None:
                 dt = max((now - self.prev_time).nanoseconds * 1e-9, 0.01)
-            d_error = (error - self.prev_error) / dt
 
+            # Integral with anti-windup clamp
+            self.integral_error += error * dt
+            self.integral_error = max(-1.5, min(1.5, self.integral_error))
+
+            raw_d_err = (error - self.prev_error) / dt
+            # Low-pass filter on derivative to suppress scan noise
+            self.filtered_d_err = (self.kd_filter * raw_d_err
+                                   + (1.0 - self.kd_filter) * self.filtered_d_err)
             self.prev_error = error
 
-            # PD controller: omega = Kp * e + Kd * de/dt
-            angular_z = self.kp * error + self.kd * d_error
-            angular_z = max(-1.0, min(1.0, angular_z))
+            # PID controller: omega = Kp*e + Ki*∫e + Kd*de/dt
+            angular_z = (self.kp * error
+                         + self.ki * self.integral_error
+                         + self.kd * self.filtered_d_err)
+            # Enforce max angular velocity
+            angular_z = max(-self.max_angular_vel, min(self.max_angular_vel, angular_z))
 
-            # Speed: v = v_base - Kv * |e|  (from T02c slide 55)
+            # Speed: v_fwd - Kv*|e|, bounded by [base_speed, max_linear_vel]
             speed = self.forward_speed - self.kv * abs(error)
+            speed = max(self.base_speed, min(self.max_linear_vel, speed))
+
+            # Proportional curvature slowdown: v scales linearly with unused turn budget.
+            # straight (ω=0) → full speed; max turn → base_speed
+            speed = speed * (1.0 - abs(angular_z) / self.max_angular_vel)
             speed = max(self.base_speed, speed)
+
+            # Inf-based corner slowdown: as left wall disappears (outer corner),
+            # infs in the left sector increase → brake so robot doesn't overshoot.
+            # 0% infs → no reduction; 100% infs → floor at base_speed.
+            left_inf_ratio = self._inf_ratio_sector(
+                msg, math.radians(-140), math.radians(-40))
+            speed *= (1.0 - left_inf_ratio)
+            speed = max(self.base_speed, speed)
+
+            # Acceleration limit — only ramp up; free to decelerate
+            max_delta = self.max_accel * dt
+            if speed > self.prev_linear_vel + max_delta:
+                speed = self.prev_linear_vel + max_delta
 
             # Slow down near front obstacles
             if front_dist < 1.5:
@@ -310,13 +384,24 @@ class WallFollowerNode(Node):
                 speed *= front_scale
                 angular_z = min(angular_z, -0.3)
 
-            cmd.linear.x = speed
+            # Wheel velocity limits (differential drive: v_l = v - ω*L/2)
+            half_L = self.wheel_sep / 2.0
+            worst_wheel = max(abs(speed - angular_z * half_L),
+                              abs(speed + angular_z * half_L))
+            if worst_wheel > self.max_wheel_vel:
+                scale = self.max_wheel_vel / worst_wheel
+                speed     *= scale
+                angular_z *= scale
+
+            cmd.linear.x  = speed
             cmd.angular.z = angular_z
             self.get_logger().info(
                 f'FOLLOW left={wall_dist:.2f}m err={error:+.2f} '
+                f'inf={left_inf_ratio:.0%} '
                 f'ang={angular_z:+.2f} spd={speed:.2f}',
                 throttle_duration_sec=1.0)
 
+        self.prev_linear_vel = cmd.linear.x
         self.prev_time = now
         self.cmd_pub.publish(cmd)
 
