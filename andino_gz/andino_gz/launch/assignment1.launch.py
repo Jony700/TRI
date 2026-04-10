@@ -30,7 +30,7 @@ ROBOT_Z = 0.05        # ground level (just above floor)
 SAMPLE_X_MIN, SAMPLE_X_MAX = -15.0, 15.0
 SAMPLE_Y_MIN, SAMPLE_Y_MAX = -15.0, 15.0
 
-FIXED_SPAWN = 0  # Set to 1 to use fixed spawn, 0 for random spawn
+FIXED_SPAWN = 1  # Set to 1 to use fixed spawn, 0 for random spawn
 
 def _box_distance(px, py, cx, cy, sx, sy):
     """Signed distance from point (px,py) to axis-aligned box centered at (cx,cy) with size (sx,sy).
@@ -128,12 +128,16 @@ def generate_launch_description():
     if not any('robots:=' in arg for arg in sys.argv):
         sys.argv.append(robots_arg)
 
+    extra_gz = os.environ.get('EXTRA_GZ_ARGS', '')
+
     andino_simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_andino_gz, 'launch', 'andino_gz.launch.py')
         ),
         launch_arguments={
             'world_name': 'assignment1.sdf',
+            'rviz': os.environ.get('NO_RVIZ', 'True'),
+            'extra_gz_args': extra_gz,
         }.items()
     )
 

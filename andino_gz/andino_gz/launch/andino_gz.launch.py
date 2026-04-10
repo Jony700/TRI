@@ -30,6 +30,10 @@ def generate_launch_description():
         'gui_config',
         default_value='default.config',
         description='Name of the gui configuration file to load.')
+    extra_gz_args_arg = DeclareLaunchArgument(
+        'extra_gz_args',
+        default_value='',
+        description='Extra args prepended to gz sim (e.g. "-s -r" for headless auto-run).')
     nav2_arg = DeclareLaunchArgument(
         'nav2', default_value='False',
         description='Enable Nav2 Bringup.')
@@ -57,9 +61,12 @@ def generate_launch_description():
     # Obtains the map path.
     map_path = PathJoinSubstitution([pkg_andino_gz, 'maps', map_name, TextJoin(substitutions=[map_name ,'.yaml'])])
     log_map_path = LogInfo(msg=TextJoin(substitutions=["Map path: ", map_path]))
+    extra_gz_args = LaunchConfiguration('extra_gz_args')
+
     # Gazebo arguments.
     gz_args = TextJoin(
         substitutions=[
+            extra_gz_args,
             world_path,
             TextJoin(substitutions=["--gui-config", gui_config_path], separator=' '),
         ],
@@ -72,6 +79,7 @@ def generate_launch_description():
             'ros_bridge': ros_bridge,
             'world_name': world_name,
             'gui_config': gui_config,
+            'extra_gz_args': extra_gz_args,
         },
         actions=[
             # Gazebo Sim
@@ -232,6 +240,7 @@ def generate_launch_description():
     ld.add_action(world_name_arg)
     ld.add_action(robots_arg)
     ld.add_action(gui_config_arg)
+    ld.add_action(extra_gz_args_arg)
     ld.add_action(nav2_arg)
     ld.add_action(map_name_arg)
     ld.add_action(params_file_arg)

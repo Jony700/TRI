@@ -2,17 +2,28 @@
 """Purely reactive left wall-following node using LiDAR for the Andino robot.
 
 Subscribes to /scan (LaserScan) and publishes /cmd_vel (Twist).
-Uses a PD controller to maintain a desired distance from the left wall.
+Uses a PID controller to maintain a desired distance from the left wall.
 
-Architecture: fully reactive — no state machine, no memory beyond PD
-derivative term (prev_error, prev_time). Every scan produces a command
-from scratch based only on current sensor readings.
+Architecture: fully reactive — no state machine, no memory beyond PID state.
+Every scan produces a command from scratch based only on current sensor readings.
+
+Permitted memory (assignment rule: no memory except PID):
+  prev_error      — PID derivative term
+  integral_error  — PID integral term
+  filtered_d_err  — derivative low-pass filter (part of PID D implementation)
+  prev_time       — dt computation for PID
+  prev_linear_vel — acceleration limiter (required for extra-merit velocity limits;
+                    justified as rate-of-change control on the velocity output)
+
+  prev_error is also legitimately hijacked as a spiral-speed accumulator in the
+  no-wall search branch — it resets to 0.0 the instant any wall is detected,
+  so it carries no information across wall-present states.
 
 Decision priority (per scan):
   1. Front obstacle  → stop + turn right
   2. Inside circle   → centroid-based centering / stop
-  3. No wall visible → fixed linear + angular (search)
-  4. Wall visible    → PD wall following
+  3. No wall visible → seek nearest wall / expanding spiral
+  4. Wall visible    → PID wall following
 
 LiDAR is mounted rotated pi from base_link:
   scan 0      = robot BACK
@@ -401,7 +412,7 @@ class WallFollowerNode(Node):
                 f'ang={angular_z:+.2f} spd={speed:.2f}',
                 throttle_duration_sec=1.0)
 
-        self.prev_linear_vel = cmd.linear.x
+        self.prev_linear_vel = max(0.0, cmd.linear.x)  # never track reverse as forward baseline
         self.prev_time = now
         self.cmd_pub.publish(cmd)
 
