@@ -298,30 +298,65 @@ class WallFollowerNode(Node):
             if min_dist != float('inf'):
                 # We see a wall somewhere!
                 # LiDAR is physically rotated by pi. Convert angle so 0 is robot FRONT.
-                angle_to_front = math.atan2(math.sin(min_angle - math.pi), math.cos(min_angle - math.pi))
+                angle_to_front = math.atan2(math.sin(min_angle - math.pi),
+                                            math.cos(min_angle - math.pi))
                 self.prev_error     = 0.0
                 self.integral_error = 0.0
 
-                # Proportional steering towards wall.
-                # cos(angle) = 1.0 when facing wall, 0 at 90°, negative when facing away.
-                # When wall is behind (|angle| > 90°): stop and rotate in place.
-                # When wall is ahead: drive forward with proportional correction.
-                seek_ang = max(-self.max_angular_vel,
-                               min(self.max_angular_vel, 1.5 * angle_to_front))
-                alignment = math.cos(angle_to_front)
-                cmd.linear.x  = self.forward_speed * max(0.0, alignment)
+                # Two-phase seek to land the robot at desired_dist with the
+                # wall on the LEFT, so Priority 4 (PID) can pick up cleanly.
+                #
+                # APPROACH  (min_dist > align_threshold):
+                #   Drive toward the wall with proportional steering. Brake
+                #   linearly with distance so the robot decelerates before
+                #   entering ALIGN instead of crashing into the front
+                #   obstacle threshold and pivoting at 0.5 m.
+                #
+                # ALIGN     (min_dist ≤ align_threshold):
+                #   Stop forward motion and pivot in place until the wall
+                #   sits on the robot's LEFT (bearing +π/2 in robot frame,
+                #   the center of the left sector). Rotating CW
+                #   (angular.z < 0) moves the wall's bearing from 0 → +π/2,
+                #   so the control law is ω = K · (angle_to_front − π/2).
+                #   As soon as the wall enters the left sector at ≤
+                #   2·desired_dist, the elif above becomes false and
+                #   Priority 4 (PID) takes over at ≈ desired_dist.
+                align_threshold = max(1.5 * self.desired_dist,
+                                      self.desired_dist + 0.4)
+                brake_start     = 3.0 * self.desired_dist
 
-                # Brake smoothly as we approach the wall so PID handoff isn't a crash.
-                # Ramps from full speed at 4× desired_dist down to ~15% at desired_dist.
-                handoff = 2.0 * self.desired_dist
-                if min_dist < 2.0 * handoff:
-                    approach_scale = max(0.15, (min_dist - self.desired_dist) / handoff)
-                    cmd.linear.x *= approach_scale
+                if min_dist > align_threshold:
+                    # APPROACH: steer toward wall, brake as we close.
+                    seek_ang = max(-self.max_angular_vel,
+                                   min(self.max_angular_vel, 1.5 * angle_to_front))
+                    alignment = math.cos(angle_to_front)
+                    fwd = self.forward_speed * max(0.0, alignment)
 
-                cmd.angular.z = seek_ang
+                    if min_dist < brake_start:
+                        span = brake_start - align_threshold
+                        # Zero forward command exactly at align_threshold so
+                        # inertia carries the robot the rest of the way with
+                        # no creep (no 0.15 floor like before).
+                        scale = max(0.0, (min_dist - align_threshold) / span)
+                        fwd *= scale
+
+                    cmd.linear.x  = fwd
+                    cmd.angular.z = seek_ang
+                    phase = 'APPROACH'
+                else:
+                    # ALIGN: stop forward, pivot to drop wall onto left side.
+                    align_err = math.atan2(
+                        math.sin(angle_to_front - math.pi / 2.0),
+                        math.cos(angle_to_front - math.pi / 2.0))
+                    cmd.linear.x  = 0.0
+                    cmd.angular.z = max(-self.max_angular_vel,
+                                        min(self.max_angular_vel, 1.5 * align_err))
+                    phase = 'ALIGN'
+
                 self.get_logger().info(
-                    f'SEEKING WALL err={math.degrees(angle_to_front):.1f}° '
-                    f'lin={cmd.linear.x:.2f} ang={seek_ang:.2f}',
+                    f'SEEK {phase} d={min_dist:.2f} '
+                    f'θ={math.degrees(angle_to_front):+.0f}° '
+                    f'lin={cmd.linear.x:.2f} ang={cmd.angular.z:+.2f}',
                     throttle_duration_sec=0.5)
             else:
                 # ── Priority 3.5: No wall ANYWHERE → expanding spiral search 

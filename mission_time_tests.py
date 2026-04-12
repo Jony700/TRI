@@ -25,7 +25,13 @@ import time
 import os
 import sys
 import csv
+import re
+import statistics
 from datetime import datetime
+
+# Regex to extract the signed error value from a throttled FOLLOW log line.
+# Matches: "FOLLOW left=1.03m err=+0.03 inf=0% ang=-0.04 spd=0.71"
+FOLLOW_ERR_RE = re.compile(r'FOLLOW\b.*?err=([+-]?\d+\.\d+)')
 
 # ── Timeout per test (seconds) ────────────────────────────────────────
 TIMEOUT = 180  # 3 minutes max per test
@@ -123,15 +129,16 @@ def run_test(test_name, overrides):
     print(f"  Overrides: {overrides if overrides else 'none (baseline)'}")
     print(f"{'='*60}")
 
-    # 1. Launch Gazebo simulation (fixed spawn, headless, auto-run, no rviz)
+    # 1. Launch Gazebo simulation (fixed spawn, GUI + auto-run + RViz)
     sim_env = os.environ.copy()
-    sim_env['EXTRA_GZ_ARGS'] = '-s -r'   # server-only + auto-run (no GUI, no play button)
-    sim_env['NO_RVIZ'] = 'False'          # disable RViz
+    sim_env['EXTRA_GZ_ARGS'] = '-r'      # auto-run (no play button); GUI stays on
+    sim_env['NO_RVIZ'] = 'True'          # enable RViz (misnomer — this var is the literal rviz arg value)
 
     sim_cmd = [
-        'ros2', 'launch', 'andino_gz', 'assignment1.launch.py'
+        'ros2', 'launch', 'andino_gz', 'assignment1.launch.py',
+        'robots:=andino={x: 9.74, y: -3.17, z: 0.05, yaw: 2.49};'
     ]
-    print(f"  Launching simulation (headless)...")
+    print(f"  Launching simulation (GUI + auto-run + RViz)...")
     sim_proc = subprocess.Popen(
         sim_cmd,
         stdout=subprocess.DEVNULL,
@@ -162,6 +169,7 @@ def run_test(test_name, overrides):
     start_time = time.time()
     mission_time = None
     success = False
+    errors = []  # signed wall-distance errors sampled during FOLLOW phase
 
     try:
         while True:
@@ -181,6 +189,12 @@ def run_test(test_name, overrides):
                         # Process ended
                         print(f"  Wall follower process ended unexpectedly")
                         break
+                    m = FOLLOW_ERR_RE.search(line)
+                    if m:
+                        try:
+                            errors.append(float(m.group(1)))
+                        except ValueError:
+                            pass
                     if SUCCESS_MSG in line:
                         mission_time = time.time() - start_time
                         success = True
@@ -209,7 +223,27 @@ def run_test(test_name, overrides):
         print(f"  Waiting {SETTLE_TIME}s for cleanup...")
         time.sleep(SETTLE_TIME)
 
-    return mission_time, success
+    # Per-run error statistics (signed error = wall_dist - desired_dist, in meters)
+    if errors:
+        abs_errs = [abs(e) for e in errors]
+        err_stats = {
+            'err_n':    len(errors),
+            'err_min':  min(errors),
+            'err_max':  max(errors),
+            'err_mean': statistics.mean(errors),
+            'err_abs_mean': statistics.mean(abs_errs),
+            'err_std':  statistics.pstdev(errors) if len(errors) > 1 else 0.0,
+        }
+        print(f"  Wall-follow error (N={err_stats['err_n']}): "
+              f"min={err_stats['err_min']:+.3f} max={err_stats['err_max']:+.3f} "
+              f"mean={err_stats['err_mean']:+.3f} |mean|={err_stats['err_abs_mean']:.3f} "
+              f"std={err_stats['err_std']:.3f}")
+    else:
+        err_stats = {'err_n': 0, 'err_min': None, 'err_max': None,
+                     'err_mean': None, 'err_abs_mean': None, 'err_std': None}
+        print("  Wall-follow error: no samples captured")
+
+    return mission_time, success, err_stats
 
 
 def main():
@@ -219,19 +253,23 @@ def main():
     print("\n" + "="*70)
     print("  MISSION TIME TEST RUNNER")
     print(f"  {len(TESTS)} tests, {TIMEOUT}s timeout each")
-    print(f"  Fixed spawn: x=-2.5, y=5.0, yaw=0.0")
+    print(f"  Fixed spawn: x=9.74, y=-3.17, yaw=2.49  (6m radially out from seg_1 → spiral → full-map loop)")
     print(f"  Results will be saved to: {csv_path}")
     print("="*70)
 
     for i, (name, overrides) in enumerate(TESTS):
         print(f"\n  [{i+1}/{len(TESTS)}]", end="")
         try:
-            mission_time, success = run_test(name, overrides)
+            mission_time, success, err_stats = run_test(name, overrides)
         except KeyboardInterrupt:
             print("\n\nAborted by user. Saving partial results...")
             break
 
         params = {**BASELINE, **overrides}
+
+        def _fmt(v):
+            return f"{v:+.3f}" if isinstance(v, (int, float)) else ""
+
         results.append({
             'test': name,
             'time_s': f"{mission_time:.1f}" if mission_time else "FAIL",
@@ -243,6 +281,14 @@ def main():
             'max_accel': params['max_accel'],
             'max_angular_vel': params['max_angular_vel'],
             'max_linear_vel': params['max_linear_vel'],
+            'err_n':        err_stats['err_n'],
+            'err_min':      _fmt(err_stats['err_min']),
+            'err_max':      _fmt(err_stats['err_max']),
+            'err_mean':     _fmt(err_stats['err_mean']),
+            'err_abs_mean': (f"{err_stats['err_abs_mean']:.3f}"
+                             if err_stats['err_abs_mean'] is not None else ""),
+            'err_std':      (f"{err_stats['err_std']:.3f}"
+                             if err_stats['err_std'] is not None else ""),
         })
 
     # ── Save CSV ──────────────────────────────────────────────────────
@@ -255,16 +301,21 @@ def main():
         print(f"\nResults saved to {csv_path}")
 
     # ── Print table ───────────────────────────────────────────────────
-    print("\n" + "="*90)
-    print(f"{'Test':<16} {'Time(s)':<10} {'Kp':<6} {'Ki':<6} {'Kd':<6} "
-          f"{'Vel':<6} {'Accel':<7} {'AngVel':<7} {'Result':<8}")
-    print("-"*90)
+    print("\n" + "="*130)
+    print(f"{'Test':<14} {'Time(s)':<9} {'Kp':<5} {'Ki':<5} {'Kd':<5} "
+          f"{'Vel':<5} {'Accel':<6} {'AngVel':<6} "
+          f"{'errMin':<8} {'errMax':<8} {'errMean':<9} {'|err|':<7} {'errStd':<7} "
+          f"{'Result':<6}")
+    print("-"*130)
     for r in results:
         status = "OK" if r['success'] else "FAIL"
-        print(f"{r['test']:<16} {r['time_s']:<10} {r['kp']:<6} {r['ki']:<6} "
-              f"{r['kd']:<6} {r['forward_speed']:<6} {r['max_accel']:<7} "
-              f"{r['max_angular_vel']:<7} {status:<8}")
-    print("="*90)
+        print(f"{r['test']:<14} {r['time_s']:<9} {r['kp']:<5} {r['ki']:<5} "
+              f"{r['kd']:<5} {r['forward_speed']:<5} {r['max_accel']:<6} "
+              f"{r['max_angular_vel']:<6} "
+              f"{str(r['err_min']):<8} {str(r['err_max']):<8} "
+              f"{str(r['err_mean']):<9} {str(r['err_abs_mean']):<7} "
+              f"{str(r['err_std']):<7} {status:<6}")
+    print("="*130)
 
 
 if __name__ == '__main__':

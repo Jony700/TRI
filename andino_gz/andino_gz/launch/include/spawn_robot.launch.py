@@ -24,11 +24,21 @@ def get_robot_description() -> str:
     presets:
     - use_fixed_caster: false
 
+    If the ``ROBOT_URDF_FILE`` environment variable points to an existing
+    file, its contents are returned verbatim instead of processing the
+    default xacro. This allows tests (e.g. shape/size sweeps) to inject a
+    custom robot description without touching the launch files.
+
     Returns
     -------
         URDF of the robot with gazebo data
 
     """
+    override = os.environ.get('SHAPE_TEST_URDF_FILE', '').strip()
+    if override and os.path.isfile(override):
+        with open(override, 'r') as f:
+            return f.read()
+
     # Parse robot description from xacro
     robot_description_file_path = os.path.join(PKG_ANDINO_GZ, 'urdf', 'andino_gz.urdf.xacro')
     mappings = {'use_fixed_caster': 'false'}
