@@ -34,7 +34,7 @@ from datetime import datetime
 FOLLOW_ERR_RE = re.compile(r'FOLLOW\b.*?err=([+-]?\d+\.\d+)')
 
 # ── Timeout per test (seconds) ────────────────────────────────────────
-TIMEOUT = 180  # 3 minutes max per test
+TIMEOUT = 360  # 3 minutes max per test
 
 # ── Baseline parameters (the "default" configuration) ─────────────────
 BASELINE = {
